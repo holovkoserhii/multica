@@ -1,0 +1,40 @@
+# Multica — Caddy reverse proxy config
+#
+# Replace app.YOUR_DOMAIN and api.YOUR_DOMAIN with your actual (sub)domains.
+# Caddy automatically obtains and renews TLS certificates via Let's Encrypt.
+#
+# After editing:
+#   sudo systemctl reload caddy
+#
+# Free domain options:
+#   - DuckDNS:  https://www.duckdns.org  (e.g. myapp.duckdns.org)
+#   - Afraid:   https://freedns.afraid.org
+#   - No-IP:    https://www.noip.com
+
+# ── Web application (Next.js frontend) ─────────────────────────────────────
+app.YOUR_DOMAIN {
+    reverse_proxy localhost:3000
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    encode gzip
+}
+
+# ── Backend API (used by CLI / daemon for WebSocket + REST) ─────────────────
+# The browser frontend proxies API calls through Next.js (no direct access
+# needed from the browser). This subdomain is only required so the multica CLI
+# and daemon on your local machine can reach the backend:
+#   multica config set server_url https://api.YOUR_DOMAIN
+api.YOUR_DOMAIN {
+    reverse_proxy localhost:8080
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+}
