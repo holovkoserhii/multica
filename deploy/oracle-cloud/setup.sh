@@ -17,7 +17,7 @@
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
-REPO_URL="${MULTICA_REPO_URL:-https://github.com/multica-ai/multica.git}"
+REPO_URL="${MULTICA_REPO_URL:-https://github.com/holovkoserhii/multica.git}"
 INSTALL_DIR="${MULTICA_INSTALL_DIR:-$HOME/multica}"
 BRANCH="${MULTICA_BRANCH:-main}"
 
