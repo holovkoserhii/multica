@@ -92,9 +92,9 @@ sudo ufw --force reset
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow ssh
-sudo ufw allow 80/tcp    comment 'HTTP (Caddy / Let'\''s Encrypt challenge)'
-sudo ufw allow 443/tcp   comment 'HTTPS (Caddy)'
-sudo ufw allow 443/udp   comment 'HTTP/3 (Caddy, optional)'
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 443/udp
 sudo ufw --force enable
 log "UFW status:"
 sudo ufw status verbose
