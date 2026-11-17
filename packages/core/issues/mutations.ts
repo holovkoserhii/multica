@@ -1,19 +1,33 @@
-import { useState, useCallback } from "react";
-import { useMutation, useQueryClient, type QueryKey } from "@tanstack/react-query";
+import { issueBehavesAs, normalizeStatusPatch } from "./status-category";
+import {
+  hashKey,
+  useMutation,
+  useQueryClient,
+  type QueryClient,
+  type QueryKey,
+} from "@tanstack/react-query";
 import { api } from "../api";
+import { issueKeys } from "./queries";
+import { projectKeys } from "../projects/queries";
+import { inboxKeys, type ArchivedInboxCache } from "../inbox/queries";
 import {
-  issueKeys,
-  ISSUE_PAGE_SIZE,
-  type AssigneeGroupedIssuesFilter,
-  type MyIssuesFilter,
-} from "./queries";
+  cancelInboxLists,
+  isInboxListRequestInFlight,
+  onInboxInvalidate,
+  onInboxIssuesDeleted,
+  onInboxSummaryInvalidate,
+} from "../inbox/ws-updaters";
 import {
-  addIssueToBuckets,
-  findIssueLocation,
-  getBucket,
-  patchIssueInBuckets,
-  setBucket,
-} from "./cache-helpers";
+  applyIssueChange,
+  invalidateIssueDerivatives,
+  invalidateLastActivitySortedIssueLists,
+  invalidateStaleListKeys,
+  rollbackIssueChange,
+  type IssueFlatCache,
+  type IssueTableRowCache,
+} from "./cache-coordinator";
+import { issueChangedDims } from "./surface/membership";
+import { addIssueToBuckets } from "./cache-helpers";
 import {
   cleanupDeletedIssueCaches,
   collectDeletedIssueCacheMetadata,
@@ -24,19 +38,34 @@ import {
   pruneDeletedIssueFromParentChildrenCaches,
 } from "./delete-cache";
 import { useWorkspaceId } from "../hooks";
+import { refreshSubscribedIssues } from "./subscribed";
+import { getCurrentWsId } from "../platform/workspace-storage";
+import { useRecentContextStore } from "../chat/recent-context-store";
 import { useRecentIssuesStore } from "./stores";
-import type { GroupedIssuesResponse, Issue, IssueAssigneeGroup, IssueReaction, IssueStatus } from "../types";
+import { useStarPromptStore } from "../star-prompt";
+import type { InboxItem, Issue, IssueReaction } from "../types";
 import type {
+  CreateCommentSubIssueManualRequest,
   CreateIssueRequest,
-  UpdateIssueRequest,
   ListIssuesCache,
+  ListIssuesResponse,
+  MoveIssueRequest,
+  UpdateIssueRequest,
+  BatchIssueLabelOps,
+  BatchIssuePropertyOps,
 } from "../types";
 import type { TimelineEntry, IssueSubscriber, Reaction } from "../types";
+import { sortTimelineEntriesAsc } from "./timeline-sort";
+import { applyCommentDeletion, removeCommentSubtree } from "./comment-deletion";
+import { configStore } from "../config";
+import {
+  onIssueAuxiliaryRevision,
+  invalidateIssueOwnerProjections,
+  reconcileIssueFullSnapshotRevision,
+} from "./ws-updaters";
 
-// ---------------------------------------------------------------------------
 // Shared mutation variable types — used by both mutation hooks and
 // useMutationState consumers to keep the type assertion in sync.
-// ---------------------------------------------------------------------------
 
 export type ToggleCommentReactionVars = {
   commentId: string;
@@ -49,125 +78,82 @@ export type ToggleIssueReactionVars = {
   existing: IssueReaction | undefined;
 };
 
-// ---------------------------------------------------------------------------
+export type UpdateIssueMutationInput = {
+  id: string;
+  /**
+   * Present only for drag/drop. `position` remains in the optimistic patch,
+   * while the request sent to the server contains relative anchors instead.
+   */
+  move_intent?: Pick<MoveIssueRequest, "before_id" | "after_id">;
+} & UpdateIssueRequest;
+
 // Per-status pagination
-// ---------------------------------------------------------------------------
 
-/**
- * Paginate one status column into the cache. Works for both the workspace
- * issue list and per-scope My Issues lists (pass `myIssues` to target the
- * latter).
- */
-export function useLoadMoreByStatus(
-  status: IssueStatus,
-  myIssues?: { scope: string; filter: MyIssuesFilter },
-) {
-  const qc = useQueryClient();
-  const wsId = useWorkspaceId();
-  const [isLoading, setIsLoading] = useState(false);
-
-  const queryKey = myIssues
-    ? issueKeys.myList(wsId, myIssues.scope, myIssues.filter)
-    : issueKeys.list(wsId);
-  const cache = qc.getQueryData<ListIssuesCache>(queryKey);
-  const bucket = cache?.byStatus[status];
-  const loaded = bucket?.issues.length ?? 0;
-  const total = bucket?.total ?? 0;
-  const hasMore = loaded < total;
-
-  const loadMore = useCallback(async () => {
-    if (isLoading || !hasMore) return;
-    setIsLoading(true);
-    try {
-      const res = await api.listIssues({
-        status,
-        limit: ISSUE_PAGE_SIZE,
-        offset: loaded,
-        ...myIssues?.filter,
-      });
-      qc.setQueryData<ListIssuesCache>(queryKey, (old) => {
-        if (!old) return old;
-        const prev = getBucket(old, status);
-        const existingIds = new Set(prev.issues.map((i) => i.id));
-        const appended = res.issues.filter((i) => !existingIds.has(i.id));
-        return setBucket(old, status, {
-          issues: [...prev.issues, ...appended],
-          total: res.total,
-        });
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  }, [qc, queryKey, status, loaded, hasMore, isLoading, myIssues?.filter]);
-
-  return { loadMore, hasMore, isLoading, total };
-}
-
-export function useLoadMoreByAssigneeGroup(
-  group: Pick<IssueAssigneeGroup, "id" | "assignee_type" | "assignee_id">,
-  queryKey: QueryKey,
-  filter: AssigneeGroupedIssuesFilter,
-) {
-  const qc = useQueryClient();
-  const [isLoading, setIsLoading] = useState(false);
-
-  const cache = qc.getQueryData<GroupedIssuesResponse>(queryKey);
-  const cachedGroup = cache?.groups.find((g) => g.id === group.id);
-  const loaded = cachedGroup?.issues.length ?? 0;
-  const total = cachedGroup?.total ?? 0;
-  const hasMore = loaded < total;
-
-  const loadMore = useCallback(async () => {
-    if (isLoading || !hasMore) return;
-    setIsLoading(true);
-    try {
-      const res = await api.listGroupedIssues({
-        group_by: "assignee",
-        limit: ISSUE_PAGE_SIZE,
-        offset: loaded,
-        ...filter,
-        group_assignee_type: group.assignee_type ?? "none",
-        group_assignee_id: group.assignee_id ?? undefined,
-      });
-      const nextGroup = res.groups[0];
-      if (!nextGroup) return;
-
-      qc.setQueryData<GroupedIssuesResponse>(queryKey, (old) => {
-        if (!old) return old;
-        return {
-          groups: old.groups.map((existing) => {
-            if (existing.id !== nextGroup.id) return existing;
-            const existingIds = new Set(existing.issues.map((issue) => issue.id));
-            const appended = nextGroup.issues.filter((issue) => !existingIds.has(issue.id));
-            return {
-              ...existing,
-              issues: [...existing.issues, ...appended],
-              total: nextGroup.total,
-            };
-          }),
-        };
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  }, [filter, group.assignee_id, group.assignee_type, hasMore, isLoading, loaded, qc, queryKey]);
-
-  return { loadMore, hasMore, isLoading, total };
-}
-
-// ---------------------------------------------------------------------------
 // Issue CRUD
-// ---------------------------------------------------------------------------
 
-export function useCreateIssue() {
+// Shared by the single and batch update hooks, so the inbox re-read can wait
+// for the last of them (see `owedInboxRereads`).
+const ISSUE_WRITE = "issue-write";
+const issueWriteMutationKey = (wsId: string) => [ISSUE_WRITE, wsId] as const;
+
+// Workspaces whose inbox lists owe a re-read, per client.
+const inboxRereadsOwed = new WeakMap<QueryClient, Set<string>>();
+
+// A client's owed re-reads, each paid once its workspace has no issue write
+// left in flight. Issued earlier, the re-read could read a pending write's old
+// value and land after that write's patch, reverting a saved change. The check
+// runs when a write reaches its terminal state, not in onSettled: TanStack
+// calls onSettled while the mutation still counts as pending, so two writes
+// settling in the same tick would each count the other and both skip
+// (MUL-7286).
+function owedInboxRereads(qc: QueryClient): Set<string> {
+  const existing = inboxRereadsOwed.get(qc);
+  if (existing) return existing;
+  const owed = new Set<string>();
+  inboxRereadsOwed.set(qc, owed);
+  qc.getMutationCache().subscribe((event) => {
+    if (event.type !== "updated") return;
+    if (event.action.type !== "success" && event.action.type !== "error") return;
+    const [kind, wsId] = event.mutation.options.mutationKey ?? [];
+    if (kind !== ISSUE_WRITE || typeof wsId !== "string") return;
+    if (!owed.has(wsId)) return;
+    if (qc.isMutating({ mutationKey: issueWriteMutationKey(wsId) }) > 0) return;
+    owed.delete(wsId);
+    void onInboxInvalidate(qc, wsId);
+  });
+  return owed;
+}
+
+// Inbox side of settling a status / priority write. It patched the inbox rows
+// optimistically, so the lists owe a re-read only when the write left them
+// behind the server: onMutate interrupted one of their requests (see
+// `cancelInboxLists`), a failure restored their rollback snapshot, or a list
+// request is still out and may have read the server before this write
+// committed. Otherwise the patch was the whole change, and no request is added.
+function settleInboxAfterIssueWrite(
+  qc: QueryClient,
+  wsId: string,
+  // Set by onMutate for status / priority writes only.
+  inboxWrite: { interrupted: boolean } | undefined,
+  failed: boolean,
+) {
+  if (!inboxWrite) return;
+  if (inboxWrite.interrupted || failed || isInboxListRequestInFlight(qc, wsId)) {
+    owedInboxRereads(qc).add(wsId);
+  }
+}
+
+function useIssueCreateMutation<TVariables>(
+  mutationFn: (variables: TVariables) => Promise<Issue>,
+) {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
   return useMutation({
-    mutationFn: (data: CreateIssueRequest) => api.createIssue(data),
+    mutationFn,
     onSuccess: (newIssue) => {
-      qc.setQueryData<ListIssuesCache>(issueKeys.list(wsId), (old) =>
-        old ? addIssueToBuckets(old, newIssue) : old,
-      );
+      for (const [key, data] of qc.getQueriesData<ListIssuesCache>({ queryKey: issueKeys.list(wsId) })) {
+        if (data) qc.setQueryData<ListIssuesCache>(key, addIssueToBuckets(data, newIssue));
+      }
       // Surface the just-created issue in cmd+k's Recent list without
       // requiring the user to open it first.
       useRecentIssuesStore.getState().recordVisit(wsId, newIssue.id);
@@ -179,27 +165,81 @@ export function useCreateIssue() {
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.flatAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
       qc.invalidateQueries({ queryKey: issueKeys.assigneeGroupsAll(wsId) });
       qc.invalidateQueries({ queryKey: issueKeys.myAssigneeGroupsAll(wsId) });
       qc.invalidateQueries({ queryKey: issueKeys.projectGanttAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.sidebarAll(wsId) });
+      qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
     },
   });
+}
+
+export function useCreateIssue() {
+  return useIssueCreateMutation((data: CreateIssueRequest) => api.createIssue(data));
+}
+
+export function useCreateCommentSubIssue() {
+  return useIssueCreateMutation(({
+    anchorCommentId,
+    data,
+  }: {
+    anchorCommentId: string;
+    data: CreateCommentSubIssueManualRequest;
+  }) => api.createCommentSubIssue(anchorCommentId, data));
 }
 
 export function useUpdateIssue() {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
   return useMutation({
-    mutationFn: ({ id, ...data }: { id: string } & UpdateIssueRequest) =>
-      api.updateIssue(id, data),
-    onMutate: ({ id, ...data }) => {
+    mutationKey: issueWriteMutationKey(wsId),
+    mutationFn: ({ id, move_intent: moveIntent, ...data }: UpdateIssueMutationInput) => {
+      if (!moveIntent) return api.updateIssue(id, data);
+      const { position: _optimisticPosition, ...target } = data;
+      return api.moveIssue(id, { ...target, ...moveIntent });
+    },
+    onMutate: ({ id, move_intent: _moveIntent, ...data }) => {
+      // suppress_run is a write-time control field, not an Issue column.
+      // description_base is merge metadata, while description itself
+      // is resolved against that base on the server and therefore is not safe
+      // to predict optimistically. Keep the authoritative raw description in
+      // cache so hidden channel-media markers remain available as the base for
+      // a rapid follow-up edit. mutationFn still sends the full payload.
+      const {
+        suppress_run: _suppressRun,
+        stop_previous_assignee_runs: _stopPreviousAssigneeRuns,
+        enter_workflow_step: _enterWorkflowStep,
+        duplicate_of_issue_id: _duplicateOfIssueId,
+        description: _description,
+        description_base: _descriptionBase,
+        title_base: _titleBase,
+        expected_revision: _expectedRevision,
+        ...patch
+      } = data;
       // Fire-and-forget cancelQueries — keeps onMutate synchronous so the
       // cache update happens in the same tick as mutate(). Awaiting would
       // yield to the event loop, letting @dnd-kit reset its visual state
       // before the optimistic update lands.
       qc.cancelQueries({ queryKey: issueKeys.list(wsId) });
-      const prevList = qc.getQueryData<ListIssuesCache>(issueKeys.list(wsId));
+      qc.cancelQueries({ queryKey: issueKeys.myAll(wsId) });
+      qc.cancelQueries({ queryKey: issueKeys.flatAll(wsId) });
+      qc.cancelQueries({ queryKey: issueKeys.tableAll(wsId) });
+      const inboxWrite =
+        patch.status !== undefined || patch.priority !== undefined
+          ? { interrupted: cancelInboxLists(qc, wsId) }
+          : undefined;
       const prevDetail = qc.getQueryData<Issue>(issueKeys.detail(wsId, id));
+      // The coordinator owns the cross-cache rules: surgical patch/rebucket
+      // where the card is loaded and still belongs, surgical REMOVE where the
+      // change moves it off a filtered surface, stale-key bookkeeping where
+      // the server result may have drifted (invalidated on settle, not here —
+      // a mid-flight refetch would stomp the optimistic state).
+      const change = applyIssueChange(qc, wsId, id, patch as Partial<Issue>, {
+        changed: issueChangedDims(patch, prevDetail),
+        baseIssue: prevDetail,
+      });
 
       // Resolve parent_issue_id from the freshest source so we can keep the
       // parent's children cache in sync (used by the parent issue's
@@ -208,7 +248,7 @@ export function useUpdateIssue() {
       // child may live only there, not in detail/list.
       let parentId: string | null =
         prevDetail?.parent_issue_id ??
-        (prevList ? findIssueLocation(prevList, id)?.issue.parent_issue_id : null) ??
+        change.prevIssue?.parent_issue_id ??
         null;
       if (!parentId) {
         const childrenCaches = qc.getQueriesData<Issue[]>({
@@ -227,44 +267,144 @@ export function useUpdateIssue() {
         ? qc.getQueryData<Issue[]>(issueKeys.children(wsId, parentId))
         : undefined;
 
-      qc.setQueryData<ListIssuesCache>(issueKeys.list(wsId), (old) =>
-        old ? patchIssueInBuckets(old, id, data) : old,
-      );
-      qc.setQueryData<Issue>(issueKeys.detail(wsId, id), (old) =>
-        old ? { ...old, ...data } : old,
-      );
       if (parentId) {
+        // When the write re-parents this issue away from `parentId` (detach
+        // to standalone, or move under a different parent), prune it from the
+        // old parent's children cache. The parent's sub-issues list renders
+        // that array directly, so a bare patch to parent_issue_id: null would
+        // leave an orphaned row in the list until the settle refetch lands.
+        // onError restores prevChildren, so the prune rolls back on failure.
+        const detachedFromParent =
+          Object.prototype.hasOwnProperty.call(patch, "parent_issue_id") &&
+          patch.parent_issue_id !== parentId;
         qc.setQueryData<Issue[]>(
           issueKeys.children(wsId, parentId),
           (old) =>
-            old?.map((c) => (c.id === id ? { ...c, ...data } : c)),
+            detachedFromParent
+              ? old?.filter((c) => c.id !== id)
+              : old?.map((c) => (c.id === id ? { ...c, ...normalizeStatusPatch(patch) } : c)),
         );
       }
-      return { prevList, prevDetail, prevChildren, parentId, id };
+      return { change, prevChildren, parentId, id, inboxWrite };
     },
-    onError: (_err, _vars, ctx) => {
-      if (ctx?.prevList) qc.setQueryData(issueKeys.list(wsId), ctx.prevList);
-      if (ctx?.prevDetail)
-        qc.setQueryData(issueKeys.detail(wsId, ctx.id), ctx.prevDetail);
+    onError: (_err, vars, ctx) => {
+      if (ctx) {
+        rollbackIssueChange(qc, wsId, ctx.id, ctx.change);
+      }
       if (ctx?.parentId && ctx.prevChildren !== undefined) {
         qc.setQueryData(
           issueKeys.children(wsId, ctx.parentId),
           ctx.prevChildren,
         );
       }
-    },
-    onSettled: (_data, _err, vars, ctx) => {
+      // A remote revision may have landed through WS after onMutate captured
+      // its rollback snapshot. Restoring that snapshot on any failed request
+      // can therefore transiently put an older entity back into cache; refresh
+      // every loaded owner projection after rollback. A revision conflict is
+      // the common case, but transport/5xx failures have the same interleave.
       qc.invalidateQueries({ queryKey: issueKeys.detail(wsId, vars.id) });
       qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
-      qc.invalidateQueries({ queryKey: issueKeys.assigneeGroupsAll(wsId) });
-      qc.invalidateQueries({ queryKey: issueKeys.myAssigneeGroupsAll(wsId) });
-      qc.invalidateQueries({ queryKey: issueKeys.projectGanttAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.flatAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
+    },
+    onSuccess: (serverIssue, vars) => {
+      // Reconcile with the authoritative server entity by patching the one card
+      // in place — NOT by invalidating + refetching the list. The list refetch
+      // is what made a successful move flicker: the optimistic card was already
+      // in the right place, then the refetch replaced the whole column and the
+      // card re-landed. updateIssue returns the full issue and a position update
+      // touches only that row, so a surgical patch is the authoritative
+      // reconcile and is a visual no-op when the optimistic value matched.
+      //
+      // baseIssue = serverIssue: membership moves were already handled
+      // optimistically; against the post-write entity the changed dims come
+      // out false unless the server coerced a different value, so this pass
+      // is the plain surgical patch it always was.
+      const {
+        suppress_run: _suppressRun,
+        stop_previous_assignee_runs: _stopPreviousAssigneeRuns,
+        enter_workflow_step: _enterWorkflowStep,
+        duplicate_of_issue_id: _duplicateOfIssueId,
+        description_base: _descriptionBase,
+        move_intent: _moveIntent,
+        id: _id,
+        ...intent
+      } = vars;
+      // Drop `properties` from the reconcile payload: the bag is owned by the
+      // property mutation pipeline (single-key atomic writes + its own
+      // optimistic state). An UpdateIssue snapshot taken before a concurrent
+      // property write resolves would otherwise overwrite the newer bag
+      // (clean-room review F3 response-ordering race).
+      const { properties: _staleBag, ...reconcilable } = serverIssue;
+      const reconcile = applyIssueChange(qc, wsId, serverIssue.id, reconcilable as typeof serverIssue, {
+        changed: issueChangedDims(intent, serverIssue),
+        baseIssue: serverIssue,
+        // The HTTP response can arrive after a newer WS event. Reconcile the
+        // committed snapshot only into projections that have not already
+        // advanced beyond it; otherwise an older successful response would
+        // undo a later remote write in cache.
+        acceptCurrent: (current) =>
+          current.revision === undefined ||
+          (serverIssue.revision !== undefined &&
+            serverIssue.revision > current.revision),
+      });
+      reconcileIssueFullSnapshotRevision(
+        qc,
+        wsId,
+        serverIssue.id,
+        serverIssue.revision,
+      );
+      // The server has committed — safe to flush any drift it reported now.
+      invalidateStaleListKeys(qc, reconcile.staleKeys);
+      if (
+        vars.status !== undefined &&
+        serverIssue.assignee_type === "agent" &&
+        serverIssue.assignee_id &&
+        issueBehavesAs(serverIssue, "done")
+      ) {
+        useStarPromptStore.getState().reportAgentIssueDone({
+          wsId,
+          agentId: serverIssue.assignee_id,
+          issueId: serverIssue.id,
+        });
+      }
+    },
+    onSettled: (_data, err, vars, ctx) => {
+      settleInboxAfterIssueWrite(qc, wsId, ctx?.inboxWrite, err !== null);
+      // The issue's own list + detail caches are reconciled surgically in
+      // onSuccess / onError, so they are deliberately NOT invalidated here — a
+      // full-list refetch on settle is what made drags flicker. Only aggregate
+      // caches that cannot be patched from a single issue are refreshed, plus
+      // the specific list keys the coordinator flagged as drifted (unknown
+      // membership, enter/leave beyond the loaded window, bucket-count drift).
+      // Those stale keys are the surgical replacement for the old blanket
+      // "invalidate myAll on project move" safety net (MUL-3669 / #4548): the
+      // old project's loaded list already had the card removed in onMutate,
+      // and only genuinely undecidable lists refetch here.
+      invalidateIssueDerivatives(qc, wsId, {
+        statusOrProjectChanged:
+          vars.status !== undefined ||
+          Object.prototype.hasOwnProperty.call(vars, "project_id"),
+      });
+      qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
+      if (ctx) {
+        invalidateStaleListKeys(qc, ctx.change.staleKeys);
+      }
       // Refresh the issue's attachments cache when the description editor
       // bound new uploads — the description editor reads `issueAttachments`
       // to resolve text-preview Eye gates, and unlike other mutations this
       // payload mutates the attachment join table.
       if (vars.attachment_ids?.length) {
         qc.invalidateQueries({ queryKey: issueKeys.attachments(vars.id) });
+      }
+      // A duplicate mark is not on Issue; refresh both sides now rather than
+      // waiting for the realtime echo.
+      if (vars.duplicate_of_issue_id) {
+        qc.invalidateQueries({ queryKey: issueKeys.duplicates(wsId, vars.id) });
+        qc.invalidateQueries({
+          queryKey: issueKeys.duplicates(wsId, vars.duplicate_of_issue_id),
+        });
       }
       // Invalidate old parent's children cache
       if (ctx?.parentId) {
@@ -281,6 +421,15 @@ export function useUpdateIssue() {
         });
         qc.invalidateQueries({ queryKey: issueKeys.childProgress(wsId) });
       }
+      // Invalidate the batched-children cache only when the parent link
+      // actually changed. The WS path (ws-updaters.ts) invalidates
+      // unconditionally because it doesn't know what the server change
+      // touched; here onMutate already patched issueKeys.children(parent)
+      // optimistically, so we only need to flush when the parent relation
+      // itself moved.
+      if (ctx?.parentId || newParentId) {
+        qc.invalidateQueries({ queryKey: issueKeys.childrenByParentsAll(wsId) });
+      }
     },
   });
 }
@@ -294,6 +443,7 @@ export function useDeleteIssue() {
       await Promise.all([
         qc.cancelQueries({ queryKey: issueKeys.list(wsId) }),
         qc.cancelQueries({ queryKey: issueKeys.myAll(wsId) }),
+        qc.cancelQueries({ queryKey: issueKeys.flatAll(wsId) }),
       ]);
       const metadata = collectDeletedIssueCacheMetadata(qc, wsId, id);
       await Promise.all(
@@ -301,9 +451,12 @@ export function useDeleteIssue() {
           qc.cancelQueries({ queryKey: issueKeys.children(wsId, parentId) }),
         ),
       );
-      const prevList = qc.getQueryData<ListIssuesCache>(issueKeys.list(wsId));
+      const prevLists = qc.getQueriesData<ListIssuesCache>({ queryKey: issueKeys.list(wsId) });
       const prevMyLists = qc.getQueriesData<ListIssuesCache>({
         queryKey: issueKeys.myAll(wsId),
+      });
+      const prevFlatLists = qc.getQueriesData<IssueFlatCache>({
+        queryKey: issueKeys.flatAll(wsId),
       });
       const prevDetail = qc.getQueryData<Issue>(issueKeys.detail(wsId, id));
       const prevChildren = new Map<string, Issue[] | undefined>();
@@ -317,12 +470,29 @@ export function useDeleteIssue() {
       pruneDeletedIssueFromListCaches(qc, wsId, id);
       pruneDeletedIssueFromParentChildrenCaches(qc, wsId, id, metadata);
       qc.removeQueries({ queryKey: issueKeys.detail(wsId, id) });
-      return { id, metadata, prevList, prevMyLists, prevDetail, prevChildren };
+      return {
+        id,
+        metadata,
+        prevLists,
+        prevMyLists,
+        prevFlatLists,
+        prevDetail,
+        prevChildren,
+      };
     },
     onError: (_err, _id, ctx) => {
-      if (ctx?.prevList) qc.setQueryData(issueKeys.list(wsId), ctx.prevList);
+      if (ctx?.prevLists) {
+        for (const [key, snapshot] of ctx.prevLists) {
+          qc.setQueryData(key, snapshot);
+        }
+      }
       if (ctx?.prevMyLists) {
         for (const [key, snapshot] of ctx.prevMyLists) {
+          qc.setQueryData(key, snapshot);
+        }
+      }
+      if (ctx?.prevFlatLists) {
+        for (const [key, snapshot] of ctx.prevFlatLists) {
           qc.setQueryData(key, snapshot);
         }
       }
@@ -336,38 +506,148 @@ export function useDeleteIssue() {
       }
     },
     onSuccess: (_data, id, ctx) => {
+      useRecentContextStore.getState().forgetContext(wsId, { type: "issue", id });
       cleanupDeletedIssueCaches(qc, wsId, id, ctx?.metadata);
+      // The deleting client's own inbox rows go with the issue; the WS echo
+      // (`issue:deleted` → `onInboxIssueDeleted`) is the backstop, not the
+      // plan — a dropped socket would leave ghost rows that 404 on click.
+      void onInboxIssuesDeleted(qc, wsId, [id]);
     },
     onSettled: (_data, _err, _id, ctx) => {
       qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.flatAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
       qc.invalidateQueries({ queryKey: issueKeys.assigneeGroupsAll(wsId) });
       qc.invalidateQueries({ queryKey: issueKeys.myAssigneeGroupsAll(wsId) });
       qc.invalidateQueries({ queryKey: issueKeys.projectGanttAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.sidebarAll(wsId) });
+      qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
       if (ctx?.metadata) invalidateDeletedIssueParentCaches(qc, wsId, ctx.metadata);
     },
   });
 }
 
+interface BatchUpdateSnapshots {
+  prevLists?: Iterable<readonly [QueryKey, unknown]>;
+  prevFlatLists?: Iterable<readonly [QueryKey, unknown]>;
+  prevTableRows?: Iterable<readonly [QueryKey, unknown]>;
+  prevSidebarLists?: Iterable<readonly [QueryKey, unknown]>;
+  prevDetailById?: Iterable<readonly [string, unknown]>;
+  prevInboxList?: unknown;
+  prevArchivedInboxCaches?: Iterable<readonly [QueryKey, unknown]>;
+  prevChildren?: Iterable<readonly [string, unknown]>;
+}
+
 export function useBatchUpdateIssues() {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
+  const rollback = (ctx: BatchUpdateSnapshots | undefined) => {
+    for (const [key, snapshot] of ctx?.prevLists ?? []) qc.setQueryData(key, snapshot);
+    for (const [key, snapshot] of ctx?.prevFlatLists ?? []) qc.setQueryData(key, snapshot);
+    for (const [key, snapshot] of ctx?.prevTableRows ?? []) qc.setQueryData(key, snapshot);
+    for (const [key, snapshot] of ctx?.prevSidebarLists ?? []) qc.setQueryData(key, snapshot);
+    for (const [id, snapshot] of ctx?.prevDetailById ?? []) qc.setQueryData(issueKeys.detail(wsId, id), snapshot);
+    if (ctx?.prevInboxList !== undefined) qc.setQueryData(inboxKeys.list(wsId), ctx.prevInboxList);
+    for (const [key, snapshot] of ctx?.prevArchivedInboxCaches ?? []) qc.setQueryData(key, snapshot);
+    for (const [parentId, snapshot] of ctx?.prevChildren ?? []) {
+      qc.setQueryData(issueKeys.children(wsId, parentId), snapshot);
+    }
+  };
   return useMutation({
+    mutationKey: issueWriteMutationKey(wsId),
     mutationFn: ({
       ids,
       updates,
+      labels,
+      properties,
     }: {
       ids: string[];
       updates: UpdateIssueRequest;
-    }) => api.batchUpdateIssues(ids, updates),
+      labels?: BatchIssueLabelOps;
+      properties?: BatchIssuePropertyOps;
+    }) =>
+      labels || properties
+        ? api.batchUpdateIssues(ids, updates, { labels, properties })
+        : api.batchUpdateIssues(ids, updates),
     onMutate: async ({ ids, updates }) => {
+      // Control and description-merge fields are not safe optimistic cache
+      // patches. The server resolves description against description_base, so
+      // preserve the authoritative raw description (including media markers)
+      // until a refetch returns the committed result.
+      const {
+        suppress_run: _suppressRun,
+        stop_previous_assignee_runs: _stopPreviousAssigneeRuns,
+        enter_workflow_step: _enterWorkflowStep,
+        description: _description,
+        description_base: _descriptionBase,
+        ...patch
+      } = updates;
       await qc.cancelQueries({ queryKey: issueKeys.list(wsId) });
-      const prevList = qc.getQueryData<ListIssuesCache>(issueKeys.list(wsId));
-      qc.setQueryData<ListIssuesCache>(issueKeys.list(wsId), (old) => {
-        if (!old) return old;
-        let next = old;
-        for (const id of ids) next = patchIssueInBuckets(next, id, updates);
-        return next;
-      });
+      await qc.cancelQueries({ queryKey: issueKeys.myAll(wsId) });
+      await qc.cancelQueries({ queryKey: issueKeys.flatAll(wsId) });
+      await qc.cancelQueries({ queryKey: issueKeys.tableAll(wsId) });
+      const inboxWrite =
+        patch.status !== undefined || patch.priority !== undefined
+          ? { interrupted: cancelInboxLists(qc, wsId) }
+          : undefined;
+
+      // Run every issue through the coordinator — the same rules table the
+      // single-issue update uses, so a batch edit patches/removes across the
+      // workspace board AND every filtered myList surface identically.
+      // Snapshots are first-wins per cache key: after the first issue's
+      // application a cache already carries partial patches, so only the
+      // first snapshot per key is pristine for rollback.
+      const prevListByHash = new Map<string, [QueryKey, ListIssuesCache]>();
+      const prevFlatListByHash = new Map<string, [QueryKey, IssueFlatCache]>();
+      const prevTableRowByHash = new Map<
+        string,
+        [QueryKey, IssueTableRowCache]
+      >();
+      const prevSidebarListByHash = new Map<string, [QueryKey, ListIssuesResponse]>();
+      const prevDetailById = new Map<string, Issue>();
+      let prevInboxList: InboxItem[] | undefined;
+      let prevArchivedInboxCaches: [QueryKey, ArchivedInboxCache | undefined][] | undefined;
+      const staleKeys: QueryKey[] = [];
+      for (const id of ids) {
+        const base = qc.getQueryData<Issue>(issueKeys.detail(wsId, id));
+        const change = applyIssueChange(qc, wsId, id, patch as Partial<Issue>, {
+          changed: issueChangedDims(patch, base),
+          baseIssue: base,
+        });
+        for (const [key, snapshot] of change.prevLists) {
+          const hash = hashKey(key);
+          if (!prevListByHash.has(hash)) prevListByHash.set(hash, [key, snapshot]);
+        }
+        for (const [key, snapshot] of change.prevFlatLists) {
+          const hash = hashKey(key);
+          if (!prevFlatListByHash.has(hash)) {
+            prevFlatListByHash.set(hash, [key, snapshot]);
+          }
+        }
+        for (const [key, snapshot] of change.prevTableRows) {
+          const hash = hashKey(key);
+          if (!prevTableRowByHash.has(hash)) {
+            prevTableRowByHash.set(hash, [key, snapshot]);
+          }
+        }
+        for (const [key, snapshot] of change.prevSidebarLists) {
+          const hash = hashKey(key);
+          if (!prevSidebarListByHash.has(hash)) {
+            prevSidebarListByHash.set(hash, [key, snapshot]);
+          }
+        }
+        if (change.prevDetail) prevDetailById.set(id, change.prevDetail);
+        if (prevInboxList === undefined && change.prevInboxList !== undefined) {
+          prevInboxList = change.prevInboxList;
+        }
+        if (
+          prevArchivedInboxCaches === undefined &&
+          change.prevArchivedInboxCaches !== undefined
+        ) {
+          prevArchivedInboxCaches = change.prevArchivedInboxCaches;
+        }
+        staleKeys.push(...change.staleKeys);
+      }
 
       // Mirror the optimistic patch into any loaded children cache so
       // sub-issue rows on a parent's detail page reflect the change too.
@@ -384,25 +664,64 @@ export function useBatchUpdateIssues() {
         affectedParentIds.add(parentId);
         prevChildren.set(parentId, data);
         qc.setQueryData<Issue[]>(issueKeys.children(wsId, parentId), (old) =>
-          old?.map((c) => (idSet.has(c.id) ? { ...c, ...updates } : c)),
+          old?.map((c) => (idSet.has(c.id) ? { ...c, ...normalizeStatusPatch(patch) } : c)),
         );
       }
 
-      return { prevList, prevChildren, affectedParentIds };
+      return {
+        prevLists: [...prevListByHash.values()],
+        prevFlatLists: [...prevFlatListByHash.values()],
+        prevTableRows: [...prevTableRowByHash.values()],
+        prevSidebarLists: [...prevSidebarListByHash.values()],
+        prevDetailById,
+        prevInboxList,
+        prevArchivedInboxCaches,
+        inboxWrite,
+        staleKeys,
+        prevChildren,
+        affectedParentIds,
+      };
     },
-    onError: (_err, _vars, ctx) => {
-      if (ctx?.prevList) qc.setQueryData(issueKeys.list(wsId), ctx.prevList);
-      if (ctx?.prevChildren) {
-        for (const [parentId, snapshot] of ctx.prevChildren) {
-          qc.setQueryData(issueKeys.children(wsId, parentId), snapshot);
-        }
-      }
-    },
-    onSettled: (_data, _err, _vars, ctx) => {
+    onError: (_err, _vars, ctx) => rollback(ctx),
+    // The server skips items its per-issue guards refuse (a status the
+    // issue's workflow does not list, an assignee it cannot take) and reports
+    // only how many it wrote. Which ones were skipped is unknown, so the
+    // optimistic writes are undone and the affected caches refetched.
+    onSuccess: (data, { ids }, ctx) => {
+      if (data.updated >= ids.length) return;
+      rollback(ctx);
       qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
-      qc.invalidateQueries({ queryKey: issueKeys.assigneeGroupsAll(wsId) });
-      qc.invalidateQueries({ queryKey: issueKeys.myAssigneeGroupsAll(wsId) });
-      qc.invalidateQueries({ queryKey: issueKeys.projectGanttAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.flatAll(wsId) });
+      for (const id of ids) qc.invalidateQueries({ queryKey: issueKeys.detail(wsId, id) });
+    },
+    onSettled: (_data, err, _vars, ctx) => {
+      settleInboxAfterIssueWrite(qc, wsId, ctx?.inboxWrite, err !== null);
+      // Deliberately NOT invalidating issueKeys.list / myAll here: the onMutate
+      // pass above is a complete surgical reconcile for the loaded bucketed
+      // boards, so a full-board refetch on settle would only re-introduce the
+      // flicker the single-issue update already removed. Aggregate / grouped
+      // caches that cannot be recomputed from a single-issue patch are
+      // refreshed below, plus the specific keys the coordinator flagged as
+      // drifted — the surgical replacement for the old blanket "invalidate
+      // myAll on project move" safety net (MUL-3669 / #4548).
+      // Label and property writes are not patched optimistically; the
+      // realtime events usually land first, and this catches a dropped socket.
+      if (_vars.labels || _vars.properties) {
+        qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
+        qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) });
+        qc.invalidateQueries({ queryKey: issueKeys.flatAll(wsId) });
+        for (const id of _vars.ids) qc.invalidateQueries({ queryKey: issueKeys.detail(wsId, id) });
+      }
+      invalidateIssueDerivatives(qc, wsId, {
+        statusOrProjectChanged:
+          _vars.updates.status !== undefined ||
+          Object.prototype.hasOwnProperty.call(_vars.updates, "project_id"),
+      });
+      qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
+      if (ctx) {
+        invalidateStaleListKeys(qc, ctx.staleKeys);
+      }
       if (ctx?.affectedParentIds && ctx.affectedParentIds.size > 0) {
         for (const parentId of ctx.affectedParentIds) {
           qc.invalidateQueries({
@@ -424,6 +743,7 @@ export function useBatchDeleteIssues() {
       await Promise.all([
         qc.cancelQueries({ queryKey: issueKeys.list(wsId) }),
         qc.cancelQueries({ queryKey: issueKeys.myAll(wsId) }),
+        qc.cancelQueries({ queryKey: issueKeys.flatAll(wsId) }),
       ]);
       const metadataById = new Map(
         ids.map((id) => [
@@ -442,9 +762,12 @@ export function useBatchDeleteIssues() {
           qc.cancelQueries({ queryKey: issueKeys.children(wsId, parentId) }),
         ),
       );
-      const prevList = qc.getQueryData<ListIssuesCache>(issueKeys.list(wsId));
+      const prevLists = qc.getQueriesData<ListIssuesCache>({ queryKey: issueKeys.list(wsId) });
       const prevMyLists = qc.getQueriesData<ListIssuesCache>({
         queryKey: issueKeys.myAll(wsId),
+      });
+      const prevFlatLists = qc.getQueriesData<IssueFlatCache>({
+        queryKey: issueKeys.flatAll(wsId),
       });
       const prevChildren = new Map<string, Issue[] | undefined>();
       for (const parentId of parentIssueIds) {
@@ -461,12 +784,28 @@ export function useBatchDeleteIssues() {
           pruneDeletedIssueFromParentChildrenCaches(qc, wsId, id, metadata);
         }
       }
-      return { prevList, prevMyLists, prevChildren, parentIssueIds, metadataById };
+      return {
+        prevLists,
+        prevMyLists,
+        prevFlatLists,
+        prevChildren,
+        parentIssueIds,
+        metadataById,
+      };
     },
     onError: (_err, _ids, ctx) => {
-      if (ctx?.prevList) qc.setQueryData(issueKeys.list(wsId), ctx.prevList);
+      if (ctx?.prevLists) {
+        for (const [key, snapshot] of ctx.prevLists) {
+          qc.setQueryData(key, snapshot);
+        }
+      }
       if (ctx?.prevMyLists) {
         for (const [key, snapshot] of ctx.prevMyLists) {
+          qc.setQueryData(key, snapshot);
+        }
+      }
+      if (ctx?.prevFlatLists) {
+        for (const [key, snapshot] of ctx.prevFlatLists) {
           qc.setQueryData(key, snapshot);
         }
       }
@@ -478,15 +817,29 @@ export function useBatchDeleteIssues() {
     },
     onSuccess: (data, ids, ctx) => {
       if (data.deleted === ids.length) {
+        const { forgetContext } = useRecentContextStore.getState();
         for (const id of ids) {
+          forgetContext(wsId, { type: "issue", id });
           cleanupDeletedIssueCaches(qc, wsId, id, ctx?.metadataById.get(id));
         }
+        // Same inbox ownership as the single delete: prune this client's rows
+        // now instead of waiting for the `issue:deleted` echoes.
+        void onInboxIssuesDeleted(qc, wsId, ids);
         return;
       }
 
-      if (ctx?.prevList) qc.setQueryData(issueKeys.list(wsId), ctx.prevList);
+      if (ctx?.prevLists) {
+        for (const [key, snapshot] of ctx.prevLists) {
+          qc.setQueryData(key, snapshot);
+        }
+      }
       if (ctx?.prevMyLists) {
         for (const [key, snapshot] of ctx.prevMyLists) {
+          qc.setQueryData(key, snapshot);
+        }
+      }
+      if (ctx?.prevFlatLists) {
+        for (const [key, snapshot] of ctx.prevFlatLists) {
           qc.setQueryData(key, snapshot);
         }
       }
@@ -500,12 +853,21 @@ export function useBatchDeleteIssues() {
       }
       qc.invalidateQueries({ queryKey: issueKeys.all(wsId) });
       invalidateDeletedIssueDependentCaches(qc, wsId);
+      // The server skipped some of the batch and only reports the count, so
+      // which inbox rows survived is unknowable client-side — re-read the
+      // inbox instead of pruning by id.
+      void onInboxInvalidate(qc, wsId);
+      void onInboxSummaryInvalidate(qc);
     },
     onSettled: (_data, _err, _ids, ctx) => {
       qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.flatAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
       qc.invalidateQueries({ queryKey: issueKeys.assigneeGroupsAll(wsId) });
       qc.invalidateQueries({ queryKey: issueKeys.myAssigneeGroupsAll(wsId) });
       qc.invalidateQueries({ queryKey: issueKeys.projectGanttAll(wsId) });
+      qc.invalidateQueries({ queryKey: issueKeys.sidebarAll(wsId) });
+      qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
       if (ctx?.parentIssueIds && ctx.parentIssueIds.size > 0) {
         invalidateDeletedIssueParentCaches(qc, wsId, {
           parentIssueIds: Array.from(ctx.parentIssueIds),
@@ -515,27 +877,37 @@ export function useBatchDeleteIssues() {
   });
 }
 
-// ---------------------------------------------------------------------------
 // Comments / Timeline
-// ---------------------------------------------------------------------------
 
 type TimelineCache = TimelineEntry[];
 
 export function useCreateComment(issueId: string) {
   const qc = useQueryClient();
+  const wsId = useWorkspaceId();
   return useMutation({
     mutationFn: ({
       content,
       type,
       parentId,
       attachmentIds,
+      suppressAgentIds,
+      steerTaskIds,
     }: {
       content: string;
       type?: string;
       parentId?: string;
       attachmentIds?: string[];
-    }) => api.createComment(issueId, content, type, parentId, attachmentIds),
+      suppressAgentIds?: string[];
+      /** Running turns this comment goes into instead of a follow-up run. */
+      steerTaskIds?: string[];
+    }) => api.createComment(issueId, content, type, parentId, attachmentIds, suppressAgentIds, steerTaskIds),
     onSuccess: (comment) => {
+      if (comment.issue_revision) {
+        onIssueAuxiliaryRevision(qc, wsId, issueId, comment.issue_revision);
+      } else {
+        invalidateIssueOwnerProjections(qc, wsId, issueId);
+      }
+      invalidateLastActivitySortedIssueLists(qc, wsId);
       const entry: TimelineEntry = {
         type: "comment",
         id: comment.id,
@@ -548,15 +920,28 @@ export function useCreateComment(issueId: string) {
         attachments: comment.attachments ?? [],
         created_at: comment.created_at,
         updated_at: comment.updated_at,
+        supplements: comment.supplements,
       };
+      const steered = !!comment.supplements?.length;
       // Dedupe by id: the `comment:created` WS event may have already added
       // this entry from the broadcast path before this onSuccess fires. Skip
-      // the append if the entry is already in the cache.
+      // the append if the entry is already in the cache — but keep the
+      // steering receipts, which that broadcast predates.
       qc.setQueryData<TimelineCache>(issueKeys.timeline(issueId), (old) => {
         if (!old) return [entry];
-        if (old.some((e) => e.id === entry.id)) return old;
-        return [...old, entry];
+        if (old.some((e) => e.id === entry.id)) {
+          return steered
+            ? old.map((e) => (e.id === entry.id && !e.supplements?.length ? { ...e, supplements: entry.supplements } : e))
+            : old;
+        }
+        return sortTimelineEntriesAsc([...old, entry]);
       });
+      // A steered turn now lists this comment among its inputs.
+      if (steered) qc.invalidateQueries({ queryKey: issueKeys.tasks(issueId) });
+      // Posting a comment changes the trigger answer itself (the enqueued
+      // task now dedupes follow-up triggers), so cached previews for this
+      // issue are stale the moment the create lands.
+      qc.invalidateQueries({ queryKey: issueKeys.commentTriggerPreview(issueId) });
     },
     // No onSettled invalidate. The `comment:created` WS broadcast keeps
     // the timeline cache fresh after a successful create, and reconnect
@@ -570,14 +955,33 @@ export function useCreateComment(issueId: string) {
 
 export function useUpdateComment(issueId: string) {
   const qc = useQueryClient();
+  const wsId = useWorkspaceId();
   return useMutation({
-    mutationFn: ({ commentId, content, attachmentIds }: { commentId: string; content: string; attachmentIds?: string[] }) =>
-      api.updateComment(commentId, content, attachmentIds),
-    onMutate: async ({ commentId, content }) => {
+    mutationFn: ({
+      commentId,
+      content,
+      attachmentIds,
+      suppressAgentIds,
+      contentBase,
+      expectedRevision,
+    }: {
+      commentId: string;
+      content: string;
+      attachmentIds: string[];
+      suppressAgentIds?: string[];
+      contentBase?: string;
+      expectedRevision?: number;
+    }) => api.updateComment(commentId, content, attachmentIds, suppressAgentIds, contentBase, expectedRevision),
+    onMutate: async ({ commentId, content, attachmentIds }) => {
       await qc.cancelQueries({ queryKey: issueKeys.timeline(issueId) });
       const prev = qc.getQueryData<TimelineCache>(issueKeys.timeline(issueId));
+      const kept = new Set(attachmentIds);
       qc.setQueryData<TimelineCache>(issueKeys.timeline(issueId), (old) =>
-        old?.map((e) => (e.id === commentId ? { ...e, content } : e)),
+        old?.map((e) =>
+          e.id === commentId
+            ? { ...e, content, attachments: e.attachments?.filter((a) => kept.has(a.id)) }
+            : e,
+        ),
       );
       return { prev };
     },
@@ -585,6 +989,16 @@ export function useUpdateComment(issueId: string) {
       if (ctx?.prev !== undefined) {
         qc.setQueryData(issueKeys.timeline(issueId), ctx.prev);
       }
+    },
+    onSuccess: (comment) => {
+      if (comment.issue_revision) {
+        onIssueAuxiliaryRevision(qc, wsId, issueId, comment.issue_revision);
+      } else {
+        // Mixed-version fallback: an older backend may have committed the
+        // aggregate revision without returning it.
+        invalidateIssueOwnerProjections(qc, wsId, issueId);
+      }
+      invalidateLastActivitySortedIssueLists(qc, wsId);
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: issueKeys.timeline(issueId) });
@@ -594,45 +1008,81 @@ export function useUpdateComment(issueId: string) {
 
 export function useDeleteComment(issueId: string) {
   const qc = useQueryClient();
+  const wsId = useWorkspaceId();
   return useMutation({
-    mutationFn: (commentId: string) => api.deleteComment(commentId),
-    onMutate: async (commentId) => {
-      await qc.cancelQueries({ queryKey: issueKeys.timeline(issueId) });
-      const prev = qc.getQueryData<TimelineCache>(issueKeys.timeline(issueId));
-
-      // Cascade: collect all descendants of the deleted comment.
-      const toRemove = new Set<string>([commentId]);
-      if (prev) {
-        let changed = true;
-        while (changed) {
-          changed = false;
-          for (const e of prev) {
-            if (
-              e.parent_id &&
-              toRemove.has(e.parent_id) &&
-              !toRemove.has(e.id)
-            ) {
-              toRemove.add(e.id);
-              changed = true;
-            }
-          }
-        }
-      }
-
-      qc.setQueryData<TimelineCache>(issueKeys.timeline(issueId), (old) =>
-        old?.filter((e) => !toRemove.has(e.id)),
-      );
-      return { prev };
+    // The capability is read when the delete runs, so the route matches the
+    // copy the confirmation showed. Older servers delete the replies too.
+    mutationFn: async (commentId: string) => {
+      const keepReplies = configStore.getState().commentDeleteKeepRepliesSupported;
+      await api.deleteComment(commentId, { keepReplies });
+      return keepReplies;
     },
-    onError: (_err, _id, ctx) => {
-      if (ctx?.prev !== undefined) {
-        qc.setQueryData(issueKeys.timeline(issueId), ctx.prev);
-      }
+    // Not optimistic: whether the comment disappears or stays as a tombstone
+    // depends on replies only the server sees for certain (#8296). Once it
+    // confirms, mirror its outcome; realtime events and the settle refetch
+    // reconcile the rest.
+    onSuccess: (keptReplies, commentId) => {
+      qc.setQueryData<TimelineCache>(issueKeys.timeline(issueId), (old) => {
+        if (!old) return old;
+        return keptReplies
+          ? applyCommentDeletion(old, commentId, new Date().toISOString())
+          : removeCommentSubtree(old, commentId);
+      });
+      // The endpoint remains 204 for compatibility, so the local caller has
+      // no body carrying issue_revision. The realtime event will narrow this
+      // with its revision when connected; this is the no-WS safety net.
+      invalidateIssueOwnerProjections(qc, wsId, issueId);
+      invalidateLastActivitySortedIssueLists(qc, wsId);
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: issueKeys.timeline(issueId) });
     },
   });
+}
+
+// Every comment id in the same thread as `commentId` — the thread root plus
+// every descendant. Mirrors the server's thread walk in
+// ClearOtherThreadResolutions so the resolve optimistic update can clear sibling
+// resolutions exactly as the backend will, instead of briefly showing two
+// resolutions until the refetch settles.
+function collectThreadCommentIds(
+  entries: TimelineCache,
+  commentId: string,
+): Set<string> {
+  const byId = new Map<string, TimelineEntry>();
+  for (const e of entries) {
+    if (e.type === "comment") byId.set(e.id, e);
+  }
+  // Walk up to the thread root (cycle-guarded against malformed parent chains).
+  let rootId = commentId;
+  const guard = new Set<string>();
+  let cur = byId.get(commentId);
+  while (cur?.parent_id && byId.has(cur.parent_id) && !guard.has(cur.id)) {
+    guard.add(cur.id);
+    rootId = cur.parent_id;
+    cur = byId.get(cur.parent_id);
+  }
+  // Expand back down over the whole subtree.
+  const childrenByParent = new Map<string, string[]>();
+  for (const e of byId.values()) {
+    if (e.parent_id) {
+      const list = childrenByParent.get(e.parent_id) ?? [];
+      list.push(e.id);
+      childrenByParent.set(e.parent_id, list);
+    }
+  }
+  const ids = new Set<string>([rootId]);
+  const stack = [rootId];
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    for (const child of childrenByParent.get(id) ?? []) {
+      if (!ids.has(child)) {
+        ids.add(child);
+        stack.push(child);
+      }
+    }
+  }
+  return ids;
 }
 
 export function useResolveComment(issueId: string) {
@@ -643,18 +1093,29 @@ export function useResolveComment(issueId: string) {
     onMutate: async ({ commentId, resolved }) => {
       await qc.cancelQueries({ queryKey: issueKeys.timeline(issueId) });
       const prev = qc.getQueryData<TimelineCache>(issueKeys.timeline(issueId));
-      qc.setQueryData<TimelineCache>(issueKeys.timeline(issueId), (old) =>
-        old?.map((e) =>
-          e.id === commentId
-            ? {
-                ...e,
-                resolved_at: resolved ? new Date().toISOString() : null,
-                resolved_by_type: resolved ? e.resolved_by_type ?? null : null,
-                resolved_by_id: resolved ? e.resolved_by_id ?? null : null,
-              }
-            : e,
-        ),
-      );
+      qc.setQueryData<TimelineCache>(issueKeys.timeline(issueId), (old) => {
+        if (!old) return old;
+        // Resolving makes this comment the sole resolution in its thread, so
+        // mirror the server (ClearOtherThreadResolutions) and clear every other
+        // resolution in the same thread. Without this the cache shows two
+        // resolutions until the settle refetch, which is exactly the flash the
+        // single-resolution fix removes. Unresolve only clears its own row.
+        const threadIds = resolved ? collectThreadCommentIds(old, commentId) : null;
+        return old.map((e) => {
+          if (e.id === commentId) {
+            return {
+              ...e,
+              resolved_at: resolved ? new Date().toISOString() : null,
+              resolved_by_type: resolved ? e.resolved_by_type ?? null : null,
+              resolved_by_id: resolved ? e.resolved_by_id ?? null : null,
+            };
+          }
+          if (resolved && e.resolved_at && threadIds?.has(e.id)) {
+            return { ...e, resolved_at: null, resolved_by_type: null, resolved_by_id: null };
+          }
+          return e;
+        });
+      });
       return { prev };
     },
     onError: (_err, _vars, ctx) => {
@@ -689,12 +1150,11 @@ export function useToggleCommentReaction(issueId: string) {
   });
 }
 
-// ---------------------------------------------------------------------------
 // Issue-level Reactions
-// ---------------------------------------------------------------------------
 
 export function useToggleIssueReaction(issueId: string) {
   const qc = useQueryClient();
+  const wsId = useWorkspaceId();
   return useMutation({
     mutationKey: ["toggleIssueReaction", issueId] as const,
     mutationFn: async ({
@@ -707,15 +1167,16 @@ export function useToggleIssueReaction(issueId: string) {
       }
       return api.addIssueReaction(issueId, emoji);
     },
+    onSuccess: (reaction) => {
+      onIssueAuxiliaryRevision(qc, wsId, issueId, reaction?.issue_revision);
+    },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: issueKeys.reactions(issueId) });
     },
   });
 }
 
-// ---------------------------------------------------------------------------
 // Issue Subscribers
-// ---------------------------------------------------------------------------
 
 export function useToggleIssueSubscriber(issueId: string) {
   const qc = useQueryClient();
@@ -760,12 +1221,19 @@ export function useToggleIssueSubscriber(issueId: string) {
         qc.setQueryData<IssueSubscriber[]>(
           issueKeys.subscribers(issueId),
           (old) => {
+            // An explicit subscribe rewrites an existing row's reason to
+            // manual. The delivery tier is the server's to report, so it is
+            // dropped until onSettled refetches it.
             if (
               old?.some(
                 (s) => s.user_id === userId && s.user_type === userType,
               )
             )
-              return old;
+              return old.map((s) =>
+                s.user_id === userId && s.user_type === userType
+                  ? { ...s, reason: "manual" as const, delivery: undefined }
+                  : s,
+              );
             return [...(old ?? []), temp];
           },
         );
@@ -776,8 +1244,64 @@ export function useToggleIssueSubscriber(issueId: string) {
       if (ctx?.prev)
         qc.setQueryData(issueKeys.subscribers(issueId), ctx.prev);
     },
-    onSettled: () => {
+    onSettled: (_data, _err, { userType }) => {
       qc.invalidateQueries({ queryKey: issueKeys.subscribers(issueId) });
+      const wsId = getCurrentWsId();
+      if (wsId && userType === "member") void refreshSubscribedIssues(qc, wsId);
     },
+  });
+}
+
+/**
+ * Leave an issue AND its whole sub-tree (MUL-5483). Not optimistic: it writes
+ * to an unknown number of other issues' subscriber lists, so there is nothing
+ * determinate to patch — invalidate every subscriber query instead and let the
+ * server be the source of truth.
+ */
+export function useUnsubscribeFromIssueSubtree(issueId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      userId,
+      userType,
+    }: {
+      userId: string;
+      userType: "member" | "agent";
+    }) => {
+      await api.unsubscribeFromIssueSubtree(issueId, userId, userType);
+    },
+    onSettled: (_data, _err, { userType }) => {
+      qc.invalidateQueries({ queryKey: issueKeys.subscribersAll() });
+      const wsId = getCurrentWsId();
+      if (wsId && userType === "member") void refreshSubscribedIssues(qc, wsId);
+    },
+  });
+}
+
+export function useCancelIssueRun(issueId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (taskId: string) => api.cancelTask(issueId, taskId),
+    onSuccess: () => client.invalidateQueries({ queryKey: issueKeys.tasks(issueId) }),
+  });
+}
+
+export function useRetryTaskSupplement(issueId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ taskId, commentId }: { taskId: string; commentId: string }) =>
+      api.retryTaskSupplement(issueId, taskId, commentId),
+    onSettled: () => {
+      client.invalidateQueries({ queryKey: issueKeys.timeline(issueId) });
+      client.invalidateQueries({ queryKey: issueKeys.tasks(issueId) });
+    },
+  });
+}
+
+export function useRetryIssueRun(issueId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (taskId: string) => api.rerunIssue(issueId, taskId),
+    onSuccess: () => client.invalidateQueries({ queryKey: issueKeys.tasks(issueId) }),
   });
 }

@@ -1,57 +1,54 @@
-import { useEffect, useSyncExternalStore } from "react";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { cn } from "@multica/ui/lib/utils";
-import { useTabHistory } from "@/hooks/use-tab-history";
-import { useActiveTitleSync } from "@/hooks/use-tab-sync";
-import { useTabStore, resolveRouteIcon } from "@/stores/tab-store";
+import { MulticaIcon } from "@multica/ui/components/common/multica-icon";
+import {
+  useNavigationInputBindings,
+  useTabHistory,
+} from "@/hooks/use-tab-history";
 import {
   SidebarProvider,
-  SidebarTrigger,
   useSidebar,
 } from "@multica/ui/components/ui/sidebar";
 import { ModalRegistry } from "@multica/views/modals/registry";
-import { AppSidebar } from "@multica/views/layout";
-import { SearchCommand, SearchTrigger } from "@multica/views/search";
-import { ChatFab, ChatWindow } from "@multica/views/chat";
-import { WorkspaceSlugProvider, paths, useCurrentWorkspace } from "@multica/core/paths";
-import { getCurrentSlug, subscribeToCurrentSlug } from "@multica/core/platform";
+import {
+  AppBottomBar,
+  AppRail,
+  AppShellProvider,
+  CompactNavSheet,
+  GlobalShortcuts,
+  NavigationProgress,
+  ShellRouteDataPrefetch,
+  SpacePanel,
+} from "@multica/views/layout";
+import { SearchCommand } from "@multica/views/search";
+import { FloatingChat } from "@multica/views/chat";
+import { StarPrompt } from "@multica/views/star-prompt";
+import { WhatsNewDeck } from "@multica/views/whats-new";
+import { WorkspaceSlugProvider, useCurrentWorkspace } from "@multica/core/paths";
+import { workspaceListOptions } from "@multica/core/workspace";
+import {
+  useNavigation,
+  type LinkClickIntent,
+} from "@multica/views/navigation";
+import { getCurrentSlug, subscribeToCurrentSlug, systemNotificationPath } from "@multica/core/platform";
 import { useDesktopUnreadBadge } from "@multica/views/platform";
-import { DesktopNavigationProvider } from "@/platform/navigation";
+import { useT } from "@multica/views/i18n";
+import {
+  DesktopNavigationProvider,
+  routeContentLinkPath,
+} from "@/platform/navigation";
+import { useRenderedRouteStore } from "@/stores/rendered-route-store";
 import { TabBar } from "./tab-bar";
 import { TabContent } from "./tab-content";
 import { WindowOverlay } from "./window-overlay";
+import { WindowToolbar, WINDOW_TOOLBAR_CLEARANCE } from "./window-toolbar";
 
-function SidebarTopBar() {
-  const { canGoBack, canGoForward, goBack, goForward } = useTabHistory();
+const TOP_BAR_HEIGHT_CLASS = "h-10";
+const RAIL_WIDTH = 56;
 
-  return (
-    <div
-      className="h-12 shrink-0 flex items-center justify-end px-2"
-      style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
-    >
-      <div
-        className="flex items-center gap-0.5"
-        style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
-      >
-        <button
-          onClick={goBack}
-          disabled={!canGoBack}
-          aria-label="Go back"
-          className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30 disabled:pointer-events-none"
-        >
-          <ChevronLeft className="size-4" />
-        </button>
-        <button
-          onClick={goForward}
-          disabled={!canGoForward}
-          aria-label="Go forward"
-          className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30 disabled:pointer-events-none"
-        >
-          <ChevronRight className="size-4" />
-        </button>
-      </div>
-    </div>
-  );
+function RailTopSpacer() {
+  return <div className={cn("shrink-0", TOP_BAR_HEIGHT_CLASS)} />;
 }
 
 function useNativeNavigationGestures() {
@@ -68,43 +65,102 @@ function useNativeNavigationGestures() {
   }, [goBack, goForward]);
 }
 
-// The main area's top bar doubles as a window drag region. When the sidebar
-// is not occupying main-flow width — either user-collapsed (offcanvas) or
-// auto-hidden in mobile mode (<768px, becomes a sheet drawer) — we pad the
-// left side so tabs don't land under the macOS traffic lights (which live at
-// roughly x=16..68 and always hit-test above HTML), and surface a trigger so
-// the sidebar can be brought back without keyboard shortcut.
-function MainTopBar() {
-  const { state, isMobile } = useSidebar();
-  const sidebarHidden = state === "collapsed" || isMobile;
+
+// The main area's top bar doubles as a window drag region. The window
+// toolbar (traffic lights, history, panel toggle) floats over the rail and
+// the start of this bar, so the tabs start past whatever the rail leaves of
+// its width.
+function MainTopBar({ railMounted }: { railMounted: boolean }) {
+  const { isCompact } = useSidebar();
+  const toolbarClearance =
+    railMounted && !isCompact
+      ? WINDOW_TOOLBAR_CLEARANCE - RAIL_WIDTH
+      : WINDOW_TOOLBAR_CLEARANCE;
 
   return (
     <header
-      className={cn(
-        "h-12 shrink-0 flex items-center gap-2",
-        sidebarHidden && "pl-20",
-      )}
-      style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
+      data-slot="main-top-bar"
+      data-mc="tab-bar"
+      className={cn("relative shrink-0 flex items-center gap-2", TOP_BAR_HEIGHT_CLASS)}
+      style={{ paddingLeft: toolbarClearance }}
     >
-      {sidebarHidden && (
-        <SidebarTrigger
-          style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
-        />
-      )}
-      <TabBar />
+      <div
+        aria-hidden
+        className="absolute inset-y-0 right-0"
+        style={
+          {
+            left: toolbarClearance,
+            WebkitAppRegion: "drag",
+          } as React.CSSProperties
+        }
+      />
+      <div
+        data-slot="main-top-bar-content"
+        className="relative z-10 flex h-full min-w-0 max-w-full items-center"
+      >
+        <TabBar />
+      </div>
     </header>
+  );
+}
+
+// The content card: the space panel and the tab content share one surface,
+// split by a single hairline. It hugs the rail; without one (compact, or no
+// workspace yet) it mirrors the fixed mr-2 so it sits centred in the frame.
+function MainCanvas({
+  children,
+  railMounted,
+  showWorkspaceLoading,
+}: {
+  children: React.ReactNode;
+  railMounted: boolean;
+  showWorkspaceLoading: boolean;
+}) {
+  const { isCompact } = useSidebar();
+  const { t } = useT("layout");
+  const loadingLabel = t(($) => $.workspace_loader.loading_workspace);
+
+  return (
+    <div
+      data-slot="main-canvas"
+      data-mc="page"
+      className={cn(
+        "relative mr-2 flex min-h-0 flex-1 flex-row overflow-hidden rounded-page bg-page-canvas shadow-[var(--page-shadow,var(--surface-shadow))] ring-1 ring-page-border",
+        railMounted && !isCompact ? "ml-0" : "ml-2",
+        // In a workspace the bottom bar takes the place of the bottom margin
+        // from `md` up.
+        railMounted ? "mb-2 md:mb-0" : "mb-2",
+      )}
+    >
+      {railMounted && <SpacePanel />}
+      <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
+        {children}
+      </div>
+      {showWorkspaceLoading && (
+        <div
+          aria-label={loadingLabel}
+          aria-live="polite"
+          className="absolute inset-0 z-20 flex items-center justify-center bg-page-canvas"
+          role="status"
+        >
+          <div className="flex flex-col items-center gap-4">
+            <MulticaIcon mode="think" size={40} />
+            <p className="text-body text-muted-foreground">{loadingLabel}</p>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
 function useInternalLinkHandler() {
   useEffect(() => {
     const handler = (e: Event) => {
-      const path = (e as CustomEvent).detail?.path;
-      if (!path) return;
-      const icon = resolveRouteIcon(path);
-      const store = useTabStore.getState();
-      const tabId = store.openTab(path, path, icon);
-      store.setActiveTab(tabId);
+      const detail = (
+        e as CustomEvent<{ path?: string; disposition?: LinkClickIntent }>
+      ).detail;
+      if (!detail?.path) return;
+      routeContentLinkPath(detail.path, detail.disposition);
     };
     window.addEventListener("multica:navigate", handler);
     return () => window.removeEventListener("multica:navigate", handler);
@@ -112,31 +168,26 @@ function useInternalLinkHandler() {
 }
 
 /**
- * Bridge between the renderer and the Electron main process for inbox-level
- * OS integration. Mounted inside WorkspaceSlugProvider so it can resolve the
- * current workspace's id for the badge hook.
- *
- * Two responsibilities:
- *   1. Mirror the unread inbox count onto the dock/taskbar badge.
- *   2. When the user clicks an OS notification, open the notified
- *      workspace's inbox focused on that item. The route uses the `slug`
- *      that the notification was *emitted* with — not the currently active
- *      workspace — so a notification from workspace A always opens A's
- *      inbox even if the user has since switched to workspace B. Marking
- *      the row read is handled by InboxPage's selected-item effect, which
- *      covers both click-to-select and URL-param-select paths.
+ * Mirrors Inbox and Chat unread badges and routes native notification clicks. Chat alerts
+ * open Chat directly; inbox alerts retain their row selector. The shared path
+ * resolver uses the source workspace, and the navigation adapter performs a
+ * workspace switch when needed. Each destination owns its mark-read behavior.
  */
 function DesktopInboxBridge() {
   const workspace = useCurrentWorkspace();
   useDesktopUnreadBadge(workspace?.id ?? null);
+  const { push } = useNavigation();
+  // The adapter identity changes with the active tab's location; the ref
+  // keeps the main-process subscription stable across navigations.
+  const pushRef = useRef(push);
+  useEffect(() => {
+    pushRef.current = push;
+  }, [push]);
 
   useEffect(() => {
-    return window.desktopAPI.onInboxOpen(({ slug, issueKey }) => {
-      if (!slug) return;
-      const inboxPath = `${paths.workspace(slug).inbox()}?issue=${encodeURIComponent(issueKey)}`;
-      window.dispatchEvent(
-        new CustomEvent("multica:navigate", { detail: { path: inboxPath } }),
-      );
+    return window.desktopAPI.onInboxOpen((payload) => {
+      const path = systemNotificationPath(payload);
+      if (path) pushRef.current(path);
     });
   }, []);
 
@@ -145,14 +196,40 @@ function DesktopInboxBridge() {
 
 export function DesktopShell() {
   useInternalLinkHandler();
-  useActiveTitleSync();
   useNativeNavigationGestures();
+  useNavigationInputBindings();
 
   // Reactive read of current workspace slug from the platform singleton.
-  // On first mount, slug is null until WorkspaceRouteLayout (inside the tab
-  // router) sets it. Once set, the sidebar and other shell-level components
+  // On first mount, it is null until WorkspaceRouteLayout (inside the tab
+  // router) sets it. Once set, the rail and other shell-level components
   // can resolve workspace-scoped paths via useWorkspacePaths().
-  const slug = useSyncExternalStore(subscribeToCurrentSlug, getCurrentSlug, () => null);
+  const currentSlug = useSyncExternalStore(
+    subscribeToCurrentSlug,
+    getCurrentSlug,
+    () => null,
+  );
+  // Chrome gates on "the slug still resolves to a workspace", NOT on "the
+  // singleton is non-null" (MUL-6231 / #7021). The singleton is mutable
+  // process state that no single owner keeps in lockstep with the workspace
+  // list, so after the active workspace is deleted it can still hold the dead
+  // slug for a beat. Everything below mounts workspace-scoped components —
+  // SearchCommand calls useWorkspaceId(), which THROWS when the workspace is
+  // gone from the list. Nothing above this in the desktop tree is an error
+  // boundary, so that throw used to unmount the whole renderer and leave a
+  // blank, unresponsive window.
+  //
+  // Deriving from the list cache makes this the same gate web uses
+  // (DashboardGuard's `!workspace` check in packages/views/layout), so both
+  // shells drop workspace-scoped chrome on exactly the same signal instead of
+  // diverging. TabContent stays outside the gate: it must always render so
+  // the tab router can mount WorkspaceRouteLayout, which is what populates
+  // the singleton in the first place.
+  const { data: workspaces = [] } = useQuery(workspaceListOptions());
+  const slug =
+    currentSlug && workspaces.some((w) => w.slug === currentSlug)
+      ? currentSlug
+      : null;
+  const renderedPathname = useRenderedRouteStore((s) => s.pathname);
 
   return (
     <DesktopNavigationProvider>
@@ -160,25 +237,64 @@ export function DesktopShell() {
           use useWorkspaceSlug() (nullable) or useRequiredWorkspaceSlug()
           (throws). TabContent MUST always render so the tab router can
           mount WorkspaceRouteLayout, which calls setCurrentWorkspace()
-          to populate the slug. The sidebar gates on slug being present
-          to avoid the useRequiredWorkspaceSlug throw. Zero-workspace
-          users see the window-level overlay (new-workspace flow)
-          triggered by IndexRedirect, not a route. */}
+          to populate the slug. The rail gates on the resolved slug
+          (see above) to avoid the useRequiredWorkspaceSlug and
+          useWorkspaceId throws. Zero-workspace users see the
+          window-level overlay (new-workspace flow) triggered by
+          IndexRedirect, not a route. */}
       <WorkspaceSlugProvider slug={slug}>
         <DesktopInboxBridge />
         <div className="flex h-screen">
-          <SidebarProvider className="flex-1">
-            {slug && <AppSidebar topSlot={<SidebarTopBar />} searchSlot={<SearchTrigger />} />}
-            {/* Right side: header + content container */}
-            <div className="flex flex-1 min-w-0 flex-col">
-              <MainTopBar />
-              {/* Content area with inset styling — relative so ChatWindow/ChatFab are constrained here */}
-              <div className="relative flex flex-1 min-h-0 flex-col overflow-hidden mr-2 mb-2 ml-0.5 rounded-xl shadow-sm bg-background">
-                <TabContent />
-                {slug && <ChatWindow />}
-                {slug && <ChatFab />}
-              </div>
-            </div>
+          {/* The wrapper alone paints the frame: a second fill under it would
+              double the frame's glass over a theme's backdrop.
+              bg-app-shell is the wrapper's non-inset fill, so it also owns the
+              non-inset half of --sidebar-wrapper-fill. sidebar.tsx supplies the
+              inset half of both. Anything that has to paint an opaque layer
+              over this wrapper (the tab flares) reads the variable rather than
+              re-deriving which of the two is in play. */}
+          {/* hasExternalTrigger: WindowToolbar below parks a SidebarTrigger
+              beside the traffic lights, where it is always reachable. Page
+              headers inside the canvas must not add their own fallback one on
+              top of it — desktop windows often sit in the band where that
+              fallback renders, so every page showed a second identical icon
+              50px under this one (MUL-6218). */}
+          <SidebarProvider
+            hasExternalTrigger
+            className="flex-1 bg-app-shell [--sidebar-wrapper-fill:var(--app-shell)]"
+          >
+            <AppShellProvider renderedPathname={renderedPathname}>
+              <ShellRouteDataPrefetch>
+                {slug && <GlobalShortcuts />}
+                {slug && <WindowToolbar />}
+                {slug && (
+                  <AppRail
+                    topSlot={<RailTopSpacer />}
+                    // The card starts right under the top bar; the 7px
+                    // centres the workspace tile on its header band.
+                    className="hidden pt-[7px] md:flex"
+                  />
+                )}
+                {slug && <CompactNavSheet />}
+                {/* Right side: header + content card */}
+                <div className="flex flex-1 min-w-0 flex-col">
+                  <MainTopBar railMounted={Boolean(slug)} />
+                  <MainCanvas railMounted={Boolean(slug)} showWorkspaceLoading={!slug}>
+                    {/* Same indicator, same anchor as web: DashboardLayout puts
+                        it at the top of the content column, and this is
+                        desktop's equivalent relative/overflow-hidden box.
+                        Desktop used to have no navigation feedback at all — a
+                        click just froze until the destination committed
+                        (MUL-6404). */}
+                    <NavigationProgress />
+                    <TabContent />
+                    {slug && <FloatingChat />}
+                    {slug && <StarPrompt />}
+                    {slug && <WhatsNewDeck />}
+                  </MainCanvas>
+                  {slug && <AppBottomBar />}
+                </div>
+              </ShellRouteDataPrefetch>
+            </AppShellProvider>
           </SidebarProvider>
         </div>
         {slug && <ModalRegistry />}

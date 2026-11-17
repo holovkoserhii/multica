@@ -3,19 +3,21 @@
 import { useQuery } from "@tanstack/react-query";
 import { ActorAvatar as ActorAvatarBase } from "@multica/ui/components/common/actor-avatar";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
+import { TruncatedTooltip } from "@multica/ui/components/common/truncated-tooltip";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useWorkspacePaths } from "@multica/core/paths";
 import { agentListOptions } from "@multica/core/workspace/queries";
+import { resolvePublicFileUrl } from "@multica/core/workspace/avatar-url";
 import {
   agentTaskSnapshotOptions,
   useAgentPresenceDetail,
 } from "@multica/core/agents";
 import { issueDetailOptions } from "@multica/core/issues";
 import type { AgentTask } from "@multica/core/types";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle } from "@multica/ui/icons";
 import { AppLink } from "../../navigation";
 import { useT, useTimeAgo } from "../../i18n";
-import { workloadConfig } from "../presence";
+import { availabilityConfig, workloadConfig } from "../presence";
 
 interface AgentLivePeekCardProps {
   agentId: string;
@@ -52,7 +54,7 @@ export function AgentLivePeekCard({ agentId }: AgentLivePeekCardProps) {
 
   if (!agent) {
     return (
-      <div className="text-xs text-muted-foreground">
+      <div className="text-caption text-muted-foreground">
         {t(($) => $.profile_card.unavailable)}
       </div>
     );
@@ -72,8 +74,14 @@ export function AgentLivePeekCard({ agentId }: AgentLivePeekCardProps) {
     .toUpperCase()
     .slice(0, 2);
 
+  // Archived wins over workload — a retired agent reads "Archived", never
+  // "Idle"/"Working". availability is the unified signal (see
+  // deriveAgentPresenceDetail); for archived it's set before any task scan.
+  const isArchived =
+    presence !== "loading" && presence.availability === "archived";
   const workload = presence === "loading" ? null : presence.workload;
   const workloadVisual = workload ? workloadConfig[workload] : null;
+  const archivedVisual = availabilityConfig.archived;
 
   return (
     <div className="flex flex-col gap-3 text-left">
@@ -82,20 +90,28 @@ export function AgentLivePeekCard({ agentId }: AgentLivePeekCardProps) {
         <ActorAvatarBase
           name={agent.name}
           initials={initials}
-          avatarUrl={agent.avatar_url}
+          avatarUrl={resolvePublicFileUrl(agent.avatar_url)}
           isAgent
-          size={40}
-          className="rounded-md"
+          size="xl"
         />
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-semibold">{agent.name}</p>
+          <p className="truncate text-body font-semibold">{agent.name}</p>
           <div className="mt-0.5 inline-flex items-center gap-1.5">
-            {workloadVisual ? (
+            {isArchived ? (
+              <>
+                <archivedVisual.icon
+                  className={`h-3 w-3 shrink-0 ${archivedVisual.textClass}`}
+                />
+                <span className={`text-caption ${archivedVisual.textClass}`}>
+                  {t(($) => $.availability.archived)}
+                </span>
+              </>
+            ) : workloadVisual ? (
               <>
                 <workloadVisual.icon
                   className={`h-3 w-3 shrink-0 ${workloadVisual.textClass}`}
                 />
-                <span className={`text-xs ${workloadVisual.textClass}`}>
+                <span className={`text-caption ${workloadVisual.textClass}`}>
                   {t(($) => $.workload[workload!])}
                 </span>
               </>
@@ -107,7 +123,7 @@ export function AgentLivePeekCard({ agentId }: AgentLivePeekCardProps) {
       </div>
 
       {/* Meta rows. */}
-      <div className="flex flex-col gap-1.5 text-xs">
+      <div className="flex flex-col gap-1.5 text-caption">
         <CurrentIssueRow
           wsId={wsId}
           issueId={currentIssueId}
@@ -126,14 +142,17 @@ export function AgentLivePeekCard({ agentId }: AgentLivePeekCardProps) {
   );
 }
 
-// Pick the most recent terminal task for last-activity display. Snapshot
-// already caps this to one terminal row per agent (see queries.ts header),
-// but a defensive max-by-completed_at keeps the card honest if that shape
-// ever changes.
+// Pick the most recent terminal task for last-activity display. The snapshot
+// already caps this to one terminal row per agent (see queries.ts header), but
+// a defensive max-by-completed_at keeps the card honest if that shape ever
+// changes. Only completed / failed count, matching the snapshot's outcome
+// filter exactly: cancelled never reaches this card, and treating it as a
+// terminal outcome here would let an aborted attempt mask the agent's last
+// real result if the endpoint ever started returning it.
 function pickLatestTerminal(tasks: readonly AgentTask[]): AgentTask | null {
   let best: AgentTask | null = null;
   for (const t of tasks) {
-    if (t.status !== "completed" && t.status !== "failed" && t.status !== "cancelled") {
+    if (t.status !== "completed" && t.status !== "failed") {
       continue;
     }
     if (!t.completed_at) continue;
@@ -170,14 +189,15 @@ function CurrentIssueRow({
       <span className="w-16 shrink-0 text-muted-foreground">{label}</span>
       {issueId ? (
         issue ? (
-          <AppLink
-            href={issueHref(issueId)}
-            className="min-w-0 truncate text-brand hover:underline"
-            title={`${issue.identifier} ${issue.title}`}
-          >
-            <span className="mr-1 font-mono text-[11px]">{issue.identifier}</span>
-            <span>{issue.title}</span>
-          </AppLink>
+          <TruncatedTooltip content={`${issue.identifier} ${issue.title}`}>
+            <AppLink
+              href={issueHref(issueId)}
+              className="min-w-0 truncate text-brand hover:underline"
+            >
+              <span className="mr-1 font-mono text-micro">{issue.identifier}</span>
+              <span>{issue.title}</span>
+            </AppLink>
+          </TruncatedTooltip>
         ) : (
           <Skeleton className="h-3 w-24" />
         )
@@ -212,7 +232,7 @@ function LastActivityRow({
             // matching the project's deliberate split between current and
             // historical state.
             <span
-              className="inline-flex items-center gap-0.5 rounded bg-warning/10 px-1 py-0.5 text-[10px] font-medium text-warning"
+              className="inline-flex items-center gap-0.5 rounded-xs bg-warning/10 px-1 py-0.5 text-micro font-medium text-warning"
               title={failedLabel}
             >
               <AlertTriangle className="h-2.5 w-2.5" />

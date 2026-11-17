@@ -1,36 +1,38 @@
-export {
-  HELPER_INSTRUCTIONS,
-  HELPER_DESCRIPTION,
-  type HelperInstructionsLang,
-} from "./helper-instructions";
+import { matchLocale, type SupportedLocale } from "@multica/core/i18n";
+
 export {
   INSTALL_RUNTIME_ISSUE_TITLE,
   INSTALL_RUNTIME_ISSUE_BODY,
-  FOLLOWUP_COMMENT_PREFIX,
 } from "./install-runtime-issue";
 export {
-  CREATE_AGENT_GUIDE_ISSUE_TITLE,
-  getCreateAgentGuideBody,
-} from "./create-agent-guide-issue";
-export {
-  HELPER_STARTER_PROMPTS,
-  STARTER_CARD_IDS,
-  type StarterCardId,
-} from "./helper-starter-prompts";
-export {
-  buildUserContextSection,
-  type UserContextLabels,
-  type QuestionnaireRaw,
-} from "./user-context";
+  getMikaOnboarding,
+  type MikaContentLang,
+  type MikaOnboardingDefinition,
+} from "./mika";
+type ContentLang = "en" | "zh" | "ko" | "ja";
+
+const CONTENT_LANG_BY_LOCALE: Record<SupportedLocale, ContentLang> = {
+  en: "en",
+  "zh-Hans": "zh",
+  // No Traditional Chinese variant yet; the Simplified copy is closer to
+  // readable than the English fallback.
+  "zh-Hant": "zh",
+  ko: "ko",
+  ja: "ja",
+  // Mika's onboarding content has no French, Spanish or Russian variant yet.
+  // Those users read the English copy rather than an untranslated placeholder.
+  fr: "en",
+  es: "en",
+  ru: "en",
+};
 
 /**
- * Pick the EN or ZH content for the given user language. Maps any "zh*"
- * prefix to the Chinese variant; everything else falls back to English.
- * Mirrors the server-side `noRuntimeIssueDescription` logic.
+ * Pick persisted onboarding content for the given user language. Maps
+ * supported BCP-47 prefixes to the matching variant; everything else falls
+ * back to English. Mirrors the locale picker used by the frontend i18n layer.
  */
 export function pickContentLang(
   language: string | null | undefined,
-): "en" | "zh" {
-  if (language && language.toLowerCase().startsWith("zh")) return "zh";
-  return "en";
+): ContentLang {
+  return CONTENT_LANG_BY_LOCALE[matchLocale(language ? [language] : [])];
 }

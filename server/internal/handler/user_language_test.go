@@ -7,7 +7,70 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/multica-ai/multica/server/internal/testutil"
 )
+
+func TestUpdateMeRussianLanguageRoundTrip(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	userID := dbfx.User(t, "Russian user", "lang-ru@multica.ai", testutil.Cols{"language": "en"})
+	var updated UserResponse
+	testutil.Call(t, testHandler.UpdateMe, newPatchMeRequest(userID, `{"language":"ru"}`)).Want(http.StatusOK).JSON(&updated)
+	if updated.Language == nil || *updated.Language != "ru" {
+		t.Fatalf("updated language = %v, want ru", updated.Language)
+	}
+
+	get := newRequest(http.MethodGet, "/api/me", nil)
+	get.Header.Set("X-User-ID", userID)
+	var reloaded UserResponse
+	testutil.Call(t, testHandler.GetMe, get).Want(http.StatusOK).JSON(&reloaded)
+	if reloaded.Language == nil || *reloaded.Language != "ru" {
+		t.Fatalf("reloaded language = %v, want ru", reloaded.Language)
+	}
+}
+
+func TestUpdateMeFrenchLanguageRoundTrip(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	userID := dbfx.User(t, "French user", "lang-fr@multica.ai", testutil.Cols{"language": "en"})
+	var updated UserResponse
+	testutil.Call(t, testHandler.UpdateMe, newPatchMeRequest(userID, `{"language":"fr"}`)).Want(http.StatusOK).JSON(&updated)
+	if updated.Language == nil || *updated.Language != "fr" {
+		t.Fatalf("updated language = %v, want fr", updated.Language)
+	}
+
+	// A fresh request after reload must restore French, not the old preference.
+	get := newRequest(http.MethodGet, "/api/me", nil)
+	get.Header.Set("X-User-ID", userID)
+	var reloaded UserResponse
+	testutil.Call(t, testHandler.GetMe, get).Want(http.StatusOK).JSON(&reloaded)
+	if reloaded.Language == nil || *reloaded.Language != "fr" {
+		t.Fatalf("reloaded language = %v, want fr", reloaded.Language)
+	}
+}
+
+func TestUpdateMeTraditionalChineseLanguageRoundTrip(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	userID := dbfx.User(t, "Traditional Chinese user", "lang-zh-hant@multica.ai", testutil.Cols{"language": "en"})
+	var updated UserResponse
+	testutil.Call(t, testHandler.UpdateMe, newPatchMeRequest(userID, `{"language":"zh-Hant"}`)).Want(http.StatusOK).JSON(&updated)
+	if updated.Language == nil || *updated.Language != "zh-Hant" {
+		t.Fatalf("updated language = %v, want zh-Hant", updated.Language)
+	}
+
+	get := newRequest(http.MethodGet, "/api/me", nil)
+	get.Header.Set("X-User-ID", userID)
+	var reloaded UserResponse
+	testutil.Call(t, testHandler.GetMe, get).Want(http.StatusOK).JSON(&reloaded)
+	if reloaded.Language == nil || *reloaded.Language != "zh-Hant" {
+		t.Fatalf("reloaded language = %v, want zh-Hant", reloaded.Language)
+	}
+}
 
 func newLanguageTestUser(t *testing.T, email string) string {
 	t.Helper()
@@ -60,6 +123,46 @@ func TestUpdateMeAcceptsLanguage(t *testing.T) {
 	}
 	if got, _ := resp["language"].(string); got != "zh-Hans" {
 		t.Fatalf("expected response language=zh-Hans, got %v", resp["language"])
+	}
+}
+
+func TestUpdateMeAcceptsKoreanLanguage(t *testing.T) {
+	userID := newLanguageTestUser(t, "lang-ko@multica.ai")
+
+	w := httptest.NewRecorder()
+	req := newPatchMeRequest(userID, `{"language":"ko"}`)
+	testHandler.UpdateMe(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got, _ := resp["language"].(string); got != "ko" {
+		t.Fatalf("expected response language=ko, got %v", resp["language"])
+	}
+}
+
+func TestUpdateMeAcceptsJapaneseLanguage(t *testing.T) {
+	userID := newLanguageTestUser(t, "lang-ja@multica.ai")
+
+	w := httptest.NewRecorder()
+	req := newPatchMeRequest(userID, `{"language":"ja"}`)
+	testHandler.UpdateMe(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got, _ := resp["language"].(string); got != "ja" {
+		t.Fatalf("expected response language=ja, got %v", resp["language"])
 	}
 }
 

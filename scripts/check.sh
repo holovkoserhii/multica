@@ -18,13 +18,8 @@ set -a
 . "$ENV_FILE"
 set +a
 
-POSTGRES_DB="${POSTGRES_DB:-multica}"
-POSTGRES_USER="${POSTGRES_USER:-multica}"
-POSTGRES_PORT="${POSTGRES_PORT:-5432}"
-PORT="${PORT:-8080}"
-FRONTEND_PORT="${FRONTEND_PORT:-3000}"
-PLAYWRIGHT_BASE_URL="${PLAYWRIGHT_BASE_URL:-http://localhost:${FRONTEND_PORT}}"
-export PLAYWRIGHT_BASE_URL
+# shellcheck disable=SC1091
+. scripts/local-env.sh
 
 BACKEND_PID=""
 FRONTEND_PID=""
@@ -36,6 +31,11 @@ EXIT_CODE=0
 # Cleanup: kill only services this script started
 # --------------------------------------------------------------------------
 cleanup() {
+  local status=$?
+  # Preserve failures from unguarded commands that trigger errexit.
+  if [ "$status" -ne 0 ]; then
+    EXIT_CODE=$status
+  fi
   echo ""
   if [ "$STARTED_BACKEND" = true ] && [ -n "$BACKEND_PID" ]; then
     kill "$BACKEND_PID" 2>/dev/null && wait "$BACKEND_PID" 2>/dev/null || true
@@ -100,9 +100,11 @@ pnpm test || { EXIT_CODE=1; exit 1; }
 # --------------------------------------------------------------------------
 echo ""
 echo "==> [3/5] Go tests..."
+echo "==> Verifying Go test wrapper..."
+bash scripts/test-go.test.sh || { EXIT_CODE=1; exit 1; }
 echo "==> Running database migrations..."
 (cd server && go run ./cmd/migrate up) || { EXIT_CODE=1; exit 1; }
-(cd server && go test ./...) || { EXIT_CODE=1; exit 1; }
+bash scripts/test-go.sh || { EXIT_CODE=1; exit 1; }
 
 # --------------------------------------------------------------------------
 # Step 4: Start services for E2E (only if not already running)

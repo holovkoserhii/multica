@@ -1,4 +1,8 @@
-import type { QueryClient, QueryKey } from "@tanstack/react-query";
+import type {
+  InfiniteData,
+  QueryClient,
+  QueryKey,
+} from "@tanstack/react-query";
 import {
   agentActivityKeys,
   agentRunCountsKeys,
@@ -6,9 +10,14 @@ import {
   agentTasksKeys,
 } from "../agents/queries";
 import { labelKeys } from "../labels/queries";
-import type { Issue, ListIssuesCache } from "../types";
+import type {
+  Issue,
+  ListIssuesCache,
+  ListIssuesResponse,
+} from "../types";
 import { findIssueLocation, removeIssueFromBuckets } from "./cache-helpers";
 import { issueKeys } from "./queries";
+import { useRecentIssuesStore } from "./stores/recent-issues-store";
 
 export type DeletedIssueCacheMetadata = {
   parentIssueIds: string[];
@@ -47,11 +56,22 @@ export function collectDeletedIssueCacheMetadata(
   const detail = qc.getQueryData<Issue>(issueKeys.detail(wsId, issueId));
   collectParentId(parentIssueIds, detail?.parent_issue_id);
 
-  collectParentFromListCache(
-    parentIssueIds,
-    qc.getQueryData<ListIssuesCache>(issueKeys.list(wsId)),
-    issueId,
-  );
+  for (const [, data] of qc.getQueriesData<ListIssuesCache>({
+    queryKey: issueKeys.list(wsId),
+  })) {
+    collectParentFromListCache(parentIssueIds, data, issueId);
+  }
+
+  for (const [, data] of qc.getQueriesData<
+    InfiniteData<ListIssuesResponse, number>
+  >({ queryKey: issueKeys.flatAll(wsId) })) {
+    for (const page of data?.pages ?? []) {
+      collectParentId(
+        parentIssueIds,
+        page.issues.find((issue) => issue.id === issueId)?.parent_issue_id,
+      );
+    }
+  }
 
   for (const [, data] of qc.getQueriesData<ListIssuesCache>({
     queryKey: issueKeys.myAll(wsId),
@@ -76,9 +96,13 @@ export function pruneDeletedIssueFromListCaches(
   wsId: string,
   issueId: string,
 ) {
-  qc.setQueryData<ListIssuesCache>(issueKeys.list(wsId), (old) =>
-    old ? removeIssueFromBuckets(old, issueId) : old,
-  );
+  for (const [key] of qc.getQueriesData<ListIssuesCache>({
+    queryKey: issueKeys.list(wsId),
+  })) {
+    qc.setQueryData<ListIssuesCache>(key, (old) =>
+      old ? removeIssueFromBuckets(old, issueId) : old,
+    );
+  }
 
   for (const [key] of qc.getQueriesData<ListIssuesCache>({
     queryKey: issueKeys.myAll(wsId),
@@ -86,6 +110,24 @@ export function pruneDeletedIssueFromListCaches(
     qc.setQueryData<ListIssuesCache>(key, (old) =>
       old ? removeIssueFromBuckets(old, issueId) : old,
     );
+  }
+
+  for (const [key, data] of qc.getQueriesData<
+    InfiniteData<ListIssuesResponse, number>
+  >({ queryKey: issueKeys.flatAll(wsId) })) {
+    if (!data?.pages) continue;
+    const found = data.pages.some((page) =>
+      page.issues.some((issue) => issue.id === issueId),
+    );
+    if (!found) continue;
+    qc.setQueryData<InfiniteData<ListIssuesResponse, number>>(key, {
+      ...data,
+      pages: data.pages.map((page) => ({
+        ...page,
+        total: Math.max(0, page.total - 1),
+        issues: page.issues.filter((issue) => issue.id !== issueId),
+      })),
+    });
   }
 }
 
@@ -112,6 +154,7 @@ export function invalidateDeletedIssueParentCaches(
     qc.invalidateQueries({ queryKey: issueKeys.children(wsId, parentId) });
   }
   qc.invalidateQueries({ queryKey: issueKeys.childProgress(wsId) });
+  qc.invalidateQueries({ queryKey: issueKeys.childrenByParentsAll(wsId) });
 }
 
 export function invalidateDeletedIssueDependentCaches(
@@ -162,9 +205,18 @@ export function cleanupDeletedIssueCaches(
   qc.invalidateQueries({ queryKey: issueKeys.childProgress(wsId) });
   qc.invalidateQueries({ queryKey: issueKeys.list(wsId) });
   qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) });
+  qc.invalidateQueries({ queryKey: issueKeys.flatAll(wsId) });
+  qc.invalidateQueries({ queryKey: issueKeys.tableAll(wsId) });
   // Project Gantt cache lives outside `myAll`, so it needs an explicit
   // refresh when an issue is removed — the deleted row may have been a
   // scheduled bar visible right now.
   qc.invalidateQueries({ queryKey: issueKeys.projectGanttAll(wsId) });
+  qc.invalidateQueries({ queryKey: issueKeys.sidebarAll(wsId) });
   invalidateDeletedIssueDependentCaches(qc, wsId);
+
+  // Recent Issues store persists to localStorage and survives reloads, so a
+  // deleted id left behind keeps the Cmd+K command bar firing 404s on every
+  // open. Both the delete mutation and the WS delete event flow through here,
+  // so a single call covers self-delete and cross-client delete.
+  useRecentIssuesStore.getState().forgetIssue(wsId, issueId);
 }

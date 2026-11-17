@@ -1,49 +1,45 @@
 "use client";
 
 import { useMemo, useState, useCallback, useRef, useEffect } from "react";
+import { useRegisterCommandBarContext } from "../../search/register-context";
 import { useDefaultLayout, usePanelRef } from "react-resizable-panels";
-import { Check, ChevronRight, Link2, ListTodo, MoreHorizontal, PanelRight, Pin, PinOff, Plus, Trash2, UserMinus } from "lucide-react";
-import { useQuery, type QueryKey } from "@tanstack/react-query";
+import { Archive, ArchiveRestore, BellOff, BellRing, Check, ChevronRight, FileQuestion, Link2, PanelRight, Pencil, Pin, PinOff, Trash2, Type } from "@multica/ui/icons";
+import { useQuery } from "@tanstack/react-query";
 import { cn } from "@multica/ui/lib/utils";
+import { copyText, copyTextAndHtml } from "@multica/ui/lib/clipboard";
 import { toast } from "sonner";
-import type { Issue, IssueAssigneeGroup, ProjectStatus, ProjectPriority, UpdateIssueRequest } from "@multica/core/types";
+import type { Project, ProjectStatus, ProjectPriority } from "@multica/core/types";
 import { useAuthStore } from "@multica/core/auth";
-import { projectDetailOptions } from "@multica/core/projects/queries";
-import { useUpdateProject, useDeleteProject } from "@multica/core/projects/mutations";
+import { canDeleteProject } from "@multica/core/projects/deletion-permissions";
+import { projectDetailOptions, projectSubscriptionOptions } from "@multica/core/projects/queries";
+import { Spinner } from "@multica/ui/components/ui/spinner";
+import { useUpdateProject, useDeleteProject, useSetProjectSubscription, ProjectDeletionOfflineError } from "@multica/core/projects/mutations";
 import { pinListOptions } from "@multica/core/pins";
 import { useCreatePin, useDeletePin } from "@multica/core/pins";
-import {
-  myIssueAssigneeGroupsOptions,
-  myIssueListOptions,
-  projectGanttIssuesOptions,
-  childIssueProgressOptions,
-  type AssigneeGroupedIssuesFilter,
-  type MyIssuesFilter,
-} from "@multica/core/issues/queries";
-import { useUpdateIssue } from "@multica/core/issues/mutations";
 import { useModalStore } from "@multica/core/modals";
 import { memberListOptions, agentListOptions } from "@multica/core/workspace/queries";
 import { useWorkspaceId } from "@multica/core/hooks";
-import { useCurrentWorkspace, useWorkspacePaths } from "@multica/core/paths";
+import { useIssuesScope } from "@multica/core/issues/stores";
+import { useRecentContextStore } from "@multica/core/chat";
+import { useWorkspacePaths } from "@multica/core/paths";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { PROJECT_STATUS_ORDER, PROJECT_STATUS_CONFIG, PROJECT_PRIORITY_ORDER } from "@multica/core/projects/config";
-import { BOARD_STATUSES } from "@multica/core/issues/config";
-import { createIssueViewStore } from "@multica/core/issues/stores/view-store";
-import { ViewStoreProvider, useViewStore } from "@multica/core/issues/stores/view-store-context";
-import { filterIssues } from "../../issues/utils/filter";
 import { getProjectIssueMetrics } from "./project-issue-metrics";
 import { ActorAvatar } from "../../common/actor-avatar";
-import { AppLink, useNavigation } from "../../navigation";
+import { AppLink, currentPath, useNavigation } from "../../navigation";
 import { TitleEditor, ContentEditor, type ContentEditorRef } from "../../editor";
 import { PriorityIcon } from "../../issues/components/priority-icon";
 import { ProjectResourcesSection } from "./project-resources-section";
-import { IssuesHeader } from "../../issues/components/issues-header";
-import { BoardView } from "../../issues/components/board-view";
-import { ListView } from "../../issues/components/list-view";
-import { GanttView } from "../../issues/components/gantt-view";
-import { BatchActionToolbar } from "../../issues/components/batch-action-toolbar";
+import { ProjectStartDatePicker } from "./project-start-date-picker";
+import { ProjectDueDatePicker } from "./project-due-date-picker";
+import { ProjectAccessControl } from "./project-access";
+import { ProjectLeadPicker } from "./project-lead-picker";
+import { ProjectWorkflowControl } from "../../workflows/project-workflow-row";
+import { ProjectWorkflowMenuItem, ProjectWorkflowSheet } from "../../workflows/project-workflow-sheet";
+import { IssueSurface } from "../../issues/surface/issue-surface";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
-import { Button } from "@multica/ui/components/ui/button";
+import { Button, buttonVariants } from "@multica/ui/components/ui/button";
+import { TooltipHint } from "@multica/ui/components/common/tooltip-hint";
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@multica/ui/components/ui/resizable";
 import { Sheet, SheetContent } from "@multica/ui/components/ui/sheet";
 import { useIsMobile } from "@multica/ui/hooks/use-mobile";
@@ -65,7 +61,15 @@ import {
   TooltipContent,
 } from "@multica/ui/components/ui/tooltip";
 import { EmojiPicker } from "@multica/ui/components/common/emoji-picker";
-import { PageHeader } from "../../layout/page-header";
+import { IssueViewHeader } from "../../issue-views/view-header";
+import {
+  AnimatedRightSidebar,
+  getAnimatedRightSidebarInitialOpen,
+  rightSidebarPanelMotionProps,
+  useAnimatedRightSidebarState,
+  useRightSidebarShortcut,
+} from "../../layout/animated-right-sidebar";
+import { CollectionPageState } from "../../layout/collection-page";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -77,12 +81,18 @@ import {
   AlertDialogTitle,
 } from "@multica/ui/components/ui/alert-dialog";
 import { useT } from "../../i18n";
-import { useProjectStatusLabels, useProjectPriorityLabels } from "./labels";
-import { matchesPinyin } from "../../editor/extensions/pinyin-match";
+import { titleLinkPayload } from "../../common/title-link";
+import { useProjectStatusLabels, useProjectPriorityLabels, useFormatRelativeDate } from "./labels";
+import {
+  ArchivedProjectNotice,
+  ArchivedProjectTag,
+  useArchiveProjects,
+  useOfferArchiveOnComplete,
+  useRestoreProjects,
+} from "./project-archive";
+import { PAGE_GUTTER } from "../../layout/page-header";
 
-// ---------------------------------------------------------------------------
 // Property row — sidebar property display
-// ---------------------------------------------------------------------------
 
 function PropRow({
   label,
@@ -93,240 +103,25 @@ function PropRow({
 }) {
   return (
     <div className="flex min-h-8 items-center gap-2 rounded-md px-2 -mx-2 hover:bg-accent/50 transition-colors">
-      <span className="w-16 shrink-0 text-xs text-muted-foreground">{label}</span>
-      <div className="flex min-w-0 flex-1 items-center gap-1.5 text-xs truncate">
+      <span className="w-16 shrink-0 text-caption text-muted-foreground">{label}</span>
+      <div className="flex min-w-0 flex-1 items-center gap-1.5 text-caption truncate">
         {children}
       </div>
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Project Issues — reuses the existing issues list/board components
-// ---------------------------------------------------------------------------
-
-const projectViewStore = createIssueViewStore("project_issues_view");
-
-function ProjectIssuesContent({
-  projectId,
-  projectIssues,
-  assigneeGroups,
-  assigneeGroupQueryKey,
-  assigneeGroupFilter,
-  scope,
-  filter,
-  ganttIssues,
-}: {
-  projectId: string;
-  projectIssues: Issue[];
-  assigneeGroups?: IssueAssigneeGroup[];
-  assigneeGroupQueryKey?: QueryKey;
-  assigneeGroupFilter?: AssigneeGroupedIssuesFilter;
-  scope: string;
-  filter: MyIssuesFilter;
-  ganttIssues: Issue[];
-}) {
-  const { t } = useT("projects");
-  const wsId = useWorkspaceId();
-  const viewMode = useViewStore((s) => s.viewMode);
-  const statusFilters = useViewStore((s) => s.statusFilters);
-  const priorityFilters = useViewStore((s) => s.priorityFilters);
-  const assigneeFilters = useViewStore((s) => s.assigneeFilters);
-  const includeNoAssignee = useViewStore((s) => s.includeNoAssignee);
-  const creatorFilters = useViewStore((s) => s.creatorFilters);
-  const labelFilters = useViewStore((s) => s.labelFilters);
-
-  const issues = useMemo(
-    () => filterIssues(projectIssues, { statusFilters, priorityFilters, assigneeFilters, includeNoAssignee, creatorFilters, projectFilters: [], includeNoProject: false, labelFilters }),
-    [projectIssues, statusFilters, priorityFilters, assigneeFilters, includeNoAssignee, creatorFilters, labelFilters],
-  );
-
-  // Gantt rides its own dedicated query (scheduled-only) so it doesn't have
-  // to wait for every status bucket to paginate in. View-store filters still
-  // apply so toggling priority / assignee / label hides the same bars.
-  const filteredGanttIssues = useMemo(
-    () => filterIssues(ganttIssues, { statusFilters, priorityFilters, assigneeFilters, includeNoAssignee, creatorFilters, projectFilters: [], includeNoProject: false, labelFilters }),
-    [ganttIssues, statusFilters, priorityFilters, assigneeFilters, includeNoAssignee, creatorFilters, labelFilters],
-  );
-
-  const { data: childProgressMap = new Map() } = useQuery(childIssueProgressOptions(wsId));
-
-  const visibleStatuses = useMemo(() => {
-    if (statusFilters.length > 0)
-      return BOARD_STATUSES.filter((s) => statusFilters.includes(s));
-    return BOARD_STATUSES;
-  }, [statusFilters]);
-
-  const hiddenStatuses = useMemo(
-    () => BOARD_STATUSES.filter((s) => !visibleStatuses.includes(s)),
-    [visibleStatuses],
-  );
-
-  const updateIssueMutation = useUpdateIssue();
-  const handleMoveIssue = useCallback(
-    (issueId: string, updates: Pick<UpdateIssueRequest, "status" | "assignee_type" | "assignee_id" | "position">) => {
-      updateIssueMutation.mutate(
-        { id: issueId, ...updates },
-        {
-          onError: (err) =>
-            toast.error(
-              err instanceof Error && err.message
-                ? err.message
-                : t(($) => $.detail.toast_move_issue_failed),
-            ),
-        },
-      );
-    },
-    [updateIssueMutation, t],
-  );
-
-  // Gantt has its own data source (scheduled-only) and its own empty axis —
-  // we never short-circuit it here, otherwise an unscheduled-but-non-empty
-  // project would surface a misleading "no issues" CTA. For Board/List the
-  // bucketed cache really is the ground truth, so an empty result means an
-  // empty project.
-  if (viewMode !== "gantt" && projectIssues.length === 0) {
-    return (
-      <div className="flex flex-1 min-h-0 flex-col items-center justify-center gap-3 text-muted-foreground">
-        <ListTodo className="h-10 w-10 text-muted-foreground/40" />
-        <p className="text-sm">{t(($) => $.detail.empty_issues_title)}</p>
-        <p className="text-xs">{t(($) => $.detail.empty_issues_hint)}</p>
-        <Button
-          variant="outline"
-          size="sm"
-          className="mt-1"
-          onClick={() =>
-            useModalStore.getState().open("create-issue", { project_id: projectId })
-          }
-        >
-          <Plus className="size-3.5 mr-1.5" />
-          {t(($) => $.detail.empty_issues_new_button)}
-        </Button>
-      </div>
-    );
-  }
-
+// The project's workflow (MUL-7420).
+function ProjectWorkflowPropRow({ project, onOpen }: { project: Project; onOpen: () => void }) {
+  const { t } = useT("issues");
   return (
-    <div className="flex flex-col flex-1 min-h-0">
-      {viewMode === "board" && (
-        <BoardView
-          issues={assigneeGroups ? projectIssues : issues}
-          assigneeGroups={assigneeGroups}
-          assigneeGroupQueryKey={assigneeGroupQueryKey}
-          assigneeGroupFilter={assigneeGroupFilter}
-          visibleStatuses={visibleStatuses}
-          hiddenStatuses={hiddenStatuses}
-          onMoveIssue={handleMoveIssue}
-          childProgressMap={childProgressMap}
-          myIssuesScope={scope}
-          myIssuesFilter={filter}
-          projectId={projectId}
-        />
-      )}
-      {viewMode === "list" && (
-        <ListView
-          issues={issues}
-          visibleStatuses={visibleStatuses}
-          childProgressMap={childProgressMap}
-          myIssuesScope={scope}
-          myIssuesFilter={filter}
-          projectId={projectId}
-        />
-      )}
-      {viewMode === "gantt" && <GanttView issues={filteredGanttIssues} />}
-    </div>
+    <PropRow label={t(($) => $.workflows.project.label)}>
+      <ProjectWorkflowControl project={project} onOpen={onOpen} />
+    </PropRow>
   );
 }
 
-function ProjectIssuesSurface({
-  projectId,
-  scope,
-  filter,
-}: {
-  projectId: string;
-  scope: string;
-  filter: MyIssuesFilter;
-}) {
-  const wsId = useWorkspaceId();
-  const viewMode = useViewStore((s) => s.viewMode);
-  const grouping = useViewStore((s) => s.grouping);
-  const statusFilters = useViewStore((s) => s.statusFilters);
-  const priorityFilters = useViewStore((s) => s.priorityFilters);
-  const assigneeFilters = useViewStore((s) => s.assigneeFilters);
-  const includeNoAssignee = useViewStore((s) => s.includeNoAssignee);
-  const creatorFilters = useViewStore((s) => s.creatorFilters);
-  const labelFilters = useViewStore((s) => s.labelFilters);
-  const usesAssigneeBoard = viewMode === "board" && grouping === "assignee";
-  const usesGantt = viewMode === "gantt";
-  const assigneeGroupFilter = useMemo<AssigneeGroupedIssuesFilter>(
-    () => ({
-      ...filter,
-      statuses: statusFilters.length > 0 ? statusFilters : [...BOARD_STATUSES],
-      priorities: priorityFilters,
-      assignee_filters: assigneeFilters,
-      include_no_assignee: includeNoAssignee,
-      creator_filters: creatorFilters,
-      label_ids: labelFilters,
-    }),
-    [assigneeFilters, creatorFilters, filter, includeNoAssignee, labelFilters, priorityFilters, statusFilters],
-  );
-  const assigneeGroupsOptions = myIssueAssigneeGroupsOptions(
-    wsId,
-    scope,
-    assigneeGroupFilter,
-  );
-  // Each view owns exactly one data source. Board/List ride the bucketed
-  // `myIssueListOptions` cache; the assignee-grouped board uses the grouped
-  // endpoint; Gantt has its own scheduled-only fetch. We gate `enabled` on
-  // the current view so switching to Gantt doesn't re-trigger the full
-  // per-status fetch in the background.
-  const statusIssuesQuery = useQuery({
-    ...myIssueListOptions(wsId, scope, filter),
-    enabled: !usesAssigneeBoard && !usesGantt,
-  });
-  const assigneeGroupsQuery = useQuery({
-    ...assigneeGroupsOptions,
-    enabled: usesAssigneeBoard,
-  });
-  // Gantt has its own data source — a single (paginated) fetch of every
-  // scheduled issue in the project. Independent from the bucketed Board/List
-  // cache so it isn't bottlenecked by per-status pagination and reacts in
-  // isolation to WS updates that move issues into or out of the scheduled
-  // set.
-  const ganttIssuesQuery = useQuery({
-    ...projectGanttIssuesOptions(wsId, projectId),
-    enabled: usesGantt,
-  });
-  const bucketedIssues = usesAssigneeBoard
-    ? (assigneeGroupsQuery.data?.groups.flatMap((group) => group.issues) ?? [])
-    : (statusIssuesQuery.data ?? []);
-  const ganttIssues = ganttIssuesQuery.data ?? [];
-  // What the header empty-state check looks at depends on the view: Gantt
-  // would otherwise be blamed for an empty Board cache, even though it has
-  // its own (potentially non-empty) scheduled cache.
-  const projectIssues = usesGantt ? ganttIssues : bucketedIssues;
-
-  return (
-    <>
-      <IssuesHeader scopedIssues={projectIssues} allowGantt />
-      <ProjectIssuesContent
-        projectId={projectId}
-        projectIssues={projectIssues}
-        assigneeGroups={usesAssigneeBoard ? assigneeGroupsQuery.data?.groups : undefined}
-        assigneeGroupQueryKey={usesAssigneeBoard ? assigneeGroupsOptions.queryKey : undefined}
-        assigneeGroupFilter={usesAssigneeBoard ? assigneeGroupFilter : undefined}
-        scope={scope}
-        filter={filter}
-        ganttIssues={ganttIssues}
-      />
-      <BatchActionToolbar />
-    </>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // ProjectDetail
-// ---------------------------------------------------------------------------
 
 export function ProjectDetail({ projectId }: { projectId: string }) {
   const { t } = useT("projects");
@@ -336,26 +131,67 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
   const wsPaths = useWorkspacePaths();
   const router = useNavigation();
   const userId = useAuthStore((s) => s.user?.id);
-  const workspace = useCurrentWorkspace();
-  const workspaceName = workspace?.name;
-  const { data: project, isLoading } = useQuery(projectDetailOptions(wsId, projectId));
-  const projectScope = `project:${projectId}`;
-  const projectFilter = useMemo<MyIssuesFilter>(
-    () => ({ project_id: projectId }),
-    [projectId],
+  const deleteProject = useDeleteProject();
+  const deleted = deleteProject.isSuccess && deleteProject.variables === projectId;
+  const { requestArchive, dialog: archiveDialog } = useArchiveProjects();
+  const restore = useRestoreProjects();
+  const offerArchive = useOfferArchiveOnComplete();
+  const formatRelativeDate = useFormatRelativeDate();
+  const { data: project, isLoading } = useQuery({
+    ...projectDetailOptions(wsId, projectId),
+    enabled: !deleted,
+  });
+  useRegisterCommandBarContext(
+    useMemo(() => (project ? { kind: "project", project } : null), [project]),
+  );
+  const recordRecentContext = useRecentContextStore((s) => s.recordVisit);
+  useEffect(() => {
+    if (project) {
+      recordRecentContext(wsId, {
+        type: "project",
+        id: project.id,
+        label: project.title,
+        subtitle: project.description ?? undefined,
+        icon: project.icon,
+        projectStatus: project.status,
+      });
+    }
+  }, [project?.id, project?.title, project?.description, project?.icon, project?.status, recordRecentContext, wsId]);
+  const issueTab = useIssuesScope(`project:${projectId}`);
+  const issueScope = useMemo(
+    () => ({ type: "project" as const, projectId, actorKind: issueTab }),
+    [projectId, issueTab],
   );
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
   const { getActorName } = useActorName();
   const updateProject = useUpdateProject();
-  const deleteProject = useDeleteProject();
+  const deleting = deleteProject.isPending;
   const { data: pinnedItems = [] } = useQuery({
     ...pinListOptions(wsId, userId ?? ""),
     enabled: !!userId,
   });
   const isPinned = pinnedItems.some((p) => p.item_type === "project" && p.item_id === projectId);
+  const role = members.find((m) => m.user_id === userId)?.role ?? null;
+  const canDelete = !!project && canDeleteProject(project, userId ?? null, role, agents);
   const createPin = useCreatePin();
   const deletePinMut = useDeletePin();
+  const { data: isSubscribed = false } = useQuery({
+    ...projectSubscriptionOptions(wsId, projectId),
+    enabled: !!project,
+  });
+  const setSubscription = useSetProjectSubscription();
+  const handleToggleSubscription = () => {
+    setSubscription.mutate(
+      { id: projectId, subscribed: !isSubscribed },
+      {
+        onSuccess: (subscribed) => {
+          if (subscribed) toast.success(t(($) => $.detail.toast_subscribed));
+        },
+        onError: () => toast.error(t(($) => $.detail.toast_subscription_failed)),
+      },
+    );
+  };
   const descEditorRef = useRef<ContentEditorRef>(null);
   const isMobile = useIsMobile();
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -369,13 +205,30 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
     id: "multica_project_detail_layout",
   });
   const sidebarRef = usePanelRef();
+  const rightSidebarShortcutTargetRef = useRef<HTMLDivElement | null>(null);
+  const desktopSidebarInitialOpen = getAnimatedRightSidebarInitialOpen(
+    true,
+    defaultLayout,
+  );
   // Desktop and mobile sidebar state must be separate. A single state defaulting
   // to `true` made the mobile <Sheet> mount in the open position on first render
   // (after `useIsMobile()` flipped from false→true), briefly covering the page
   // with its modal backdrop and locking scroll — leaving the page unresponsive.
-  const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(true);
+  const {
+    open: desktopSidebarOpen,
+    visualOpen: desktopSidebarVisualOpen,
+    motionEnabled: desktopSidebarMotionEnabled,
+    beginToggle: beginDesktopSidebarToggle,
+    handleResize: handleDesktopSidebarResize,
+  } = useAnimatedRightSidebarState(desktopSidebarInitialOpen);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const sidebarOpen = isMobile ? mobileSidebarOpen : desktopSidebarOpen;
+  const [workflowSheetOpen, setWorkflowSheetOpen] = useState(false);
+  // The flow panel is its own modal sheet; it can't stack over the mobile sidebar sheet.
+  const openWorkflowSheet = useCallback(() => {
+    setMobileSidebarOpen(false);
+    setWorkflowSheetOpen(true);
+  }, []);
 
   useEffect(() => {
     if (isMobile) {
@@ -383,12 +236,25 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
     }
   }, [isMobile]);
 
+  const handleToggleSidebar = useCallback(() => {
+    if (isMobile) {
+      setMobileSidebarOpen((open) => !open);
+      return;
+    }
+
+    const panel = sidebarRef.current;
+    if (!panel) return;
+    const nextOpen = panel.isCollapsed();
+    beginDesktopSidebarToggle(nextOpen);
+    window.requestAnimationFrame(() => {
+      if (nextOpen) panel.expand();
+      else panel.collapse();
+    });
+  }, [beginDesktopSidebarToggle, isMobile, sidebarRef]);
+
+  useRightSidebarShortcut(rightSidebarShortcutTargetRef, handleToggleSidebar);
+
   // Lead popover
-  const [leadOpen, setLeadOpen] = useState(false);
-  const [leadFilter, setLeadFilter] = useState("");
-  const leadQuery = leadFilter.toLowerCase();
-  const filteredMembers = members.filter((m) => m.name.toLowerCase().includes(leadQuery) || matchesPinyin(m.name, leadQuery));
-  const filteredAgents = agents.filter((a) => !a.archived_at && (a.name.toLowerCase().includes(leadQuery) || matchesPinyin(a.name, leadQuery)));
 
   const handleUpdateField = useCallback(
     (data: Parameters<typeof updateProject.mutate>[0] extends { id: string } & infer R ? R : never) => {
@@ -398,17 +264,33 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
     [project, updateProject],
   );
 
+  const handleStatusChange = useCallback(
+    (status: ProjectStatus) => {
+      if (!project) return;
+      handleUpdateField({ status });
+      offerArchive(project, status);
+    },
+    [project, handleUpdateField, offerArchive],
+  );
+
   const handleDelete = useCallback(() => {
-    if (!project) return;
+    if (!project || deleteProject.isPending) return;
     deleteProject.mutate(project.id, {
       onSuccess: () => {
+        setDeleteDialogOpen(false);
         toast.success(t(($) => $.detail.toast_project_deleted));
         router.push(wsPaths.projects());
       },
+      onError: (err) =>
+        toast.error(
+          err instanceof ProjectDeletionOfflineError
+            ? t(($) => $.delete_dialog.offline_error)
+            : err instanceof Error ? err.message : String(err),
+        ),
     });
   }, [project, deleteProject, router, wsPaths, t]);
 
-  if (isLoading) {
+  if (isLoading || deleted) {
     return (
       <div className="mx-auto w-full max-w-4xl px-8 py-10 space-y-4">
         <Skeleton className="h-5 w-32" />
@@ -420,10 +302,27 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
   }
 
   if (!project) {
-    return <div className="flex items-center justify-center h-full text-muted-foreground">{t(($) => $.detail.not_found)}</div>;
+    return (
+      <div className="flex h-full flex-col">
+        <CollectionPageState
+          icon={FileQuestion}
+          title={t(($) => $.detail.not_found)}
+          description={t(($) => $.detail.not_found_description)}
+          actions={
+            <AppLink
+              href={wsPaths.projects()}
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+            >
+              {t(($) => $.detail.back_to_list)}
+            </AppLink>
+          }
+        />
+      </div>
+    );
   }
 
   const issueMetrics = getProjectIssueMetrics(project);
+  const archived = !!project.archived_at;
   const statusCfg = PROJECT_STATUS_CONFIG[project.status];
 
   const sidebarContent = (
@@ -431,17 +330,19 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
       {/* Icon + Title */}
       <div>
         <Popover open={iconPickerOpen} onOpenChange={setIconPickerOpen}>
-          <PopoverTrigger
-            render={
-              <button
-                type="button"
-                className="text-2xl cursor-pointer rounded-lg p-1 -ml-1 hover:bg-accent/60 transition-colors"
-                title={t(($) => $.detail.icon_tooltip)}
-              >
-                {project.icon || "📁"}
-              </button>
-            }
-          />
+          <TooltipHint label={t(($) => $.detail.icon_tooltip)}>
+            <PopoverTrigger
+              render={
+                <button
+                  type="button"
+                  className="text-display-sm cursor-pointer rounded-lg p-1 -ml-1 hover:bg-accent/60 transition-colors"
+                  aria-label={t(($) => $.detail.icon_tooltip)}
+                >
+                  {project.icon || "📁"}
+                </button>
+              }
+            />
+          </TooltipHint>
           <PopoverContent align="start" className="w-auto p-0">
             <EmojiPicker
               onSelect={(emoji) => {
@@ -455,7 +356,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
           key={`title-${projectId}`}
           defaultValue={project.title}
           placeholder={t(($) => $.detail.title_placeholder)}
-          className="mt-2 w-full text-base font-semibold leading-snug tracking-tight"
+          className="mt-2 w-full text-title-sm font-semibold leading-snug tracking-tight"
           onBlur={(value) => {
             const trimmed = value.trim();
             if (trimmed && trimmed !== project.title) handleUpdateField({ title: trimmed });
@@ -466,7 +367,8 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
       {/* Properties */}
       <div>
         <button
-          className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors mb-2 hover:bg-accent/70 ${propertiesOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
+          type="button"
+          className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-caption font-medium transition-colors mb-2 hover:bg-accent/70 ${propertiesOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
           onClick={() => setPropertiesOpen(!propertiesOpen)}
         >
           {t(($) => $.detail.section_properties)}
@@ -477,7 +379,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
-                  <button type="button" className="inline-flex items-center gap-1.5 text-xs hover:text-foreground transition-colors">
+                  <button type="button" className="inline-flex items-center gap-1.5 text-caption hover:text-foreground transition-colors">
                     <span className={cn("size-2 rounded-full", statusCfg.dotColor)} />
                     <span>{statusLabels[project.status]}</span>
                   </button>
@@ -485,7 +387,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
               />
               <DropdownMenuContent align="start" className="w-44">
                 {PROJECT_STATUS_ORDER.map((s) => (
-                  <DropdownMenuItem key={s} onClick={() => handleUpdateField({ status: s as ProjectStatus })}>
+                  <DropdownMenuItem key={s} onClick={() => handleStatusChange(s as ProjectStatus)}>
                     <span className={cn("size-2 rounded-full", PROJECT_STATUS_CONFIG[s].dotColor)} />
                     <span>{statusLabels[s]}</span>
                     {s === project.status && <Check className="ml-auto h-3.5 w-3.5" />}
@@ -498,7 +400,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
-                  <button type="button" className="inline-flex items-center gap-1.5 text-xs hover:text-foreground transition-colors">
+                  <button type="button" className="inline-flex items-center gap-1.5 text-caption hover:text-foreground transition-colors">
                     <PriorityIcon priority={project.priority} />
                     <span>{priorityLabels[project.priority]}</span>
                   </button>
@@ -515,80 +417,46 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
               </DropdownMenuContent>
             </DropdownMenu>
           </PropRow>
+          {<PropRow label={t(($) => $.access.label)}>
+            <ProjectAccessControl project={project} />
+          </PropRow>}
           <PropRow label={t(($) => $.table.lead)}>
-            <Popover open={leadOpen} onOpenChange={(v) => { setLeadOpen(v); if (!v) setLeadFilter(""); }}>
-              <PopoverTrigger
-                render={
-                  <button type="button" className="inline-flex items-center gap-1.5 text-xs hover:text-foreground transition-colors">
-                    {project.lead_type && project.lead_id ? (
-                      <>
-                        <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size={16} enableHoverCard showStatusDot />
-                        <span className="cursor-pointer">{getActorName(project.lead_type, project.lead_id)}</span>
-                      </>
-                    ) : (
-                      <span className="text-muted-foreground">{t(($) => $.lead.no_lead)}</span>
-                    )}
-                  </button>
-                }
-              />
-              <PopoverContent align="start" className="w-52 p-0">
-                <div className="px-2 py-1.5 border-b">
-                  <input
-                    type="text"
-                    value={leadFilter}
-                    onChange={(e) => setLeadFilter(e.target.value)}
-                    placeholder={t(($) => $.lead.assign_placeholder)}
-                    className="w-full bg-transparent text-sm placeholder:text-muted-foreground outline-none"
-                  />
-                </div>
-                <div className="p-1 max-h-60 overflow-y-auto">
-                  <button
-                    type="button"
-                    onClick={() => { handleUpdateField({ lead_type: null, lead_id: null }); setLeadOpen(false); }}
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent transition-colors"
-                  >
-                    <UserMinus className="h-3.5 w-3.5 text-muted-foreground" />
+            <ProjectLeadPicker
+              project={project}
+              handleUpdate={handleUpdateField}
+              renderTrigger={(leadName) => (
+                <button type="button" className="inline-flex items-center gap-1.5 text-caption hover:text-foreground transition-colors">
+                  {project.lead_type && project.lead_id ? (
+                    <>
+                      <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size="sm" enableHoverCard showStatusDot />
+                      <span className="cursor-pointer">{leadName}</span>
+                    </>
+                  ) : (
                     <span className="text-muted-foreground">{t(($) => $.lead.no_lead)}</span>
-                  </button>
-                  {filteredMembers.length > 0 && (
-                    <>
-                      <div className="px-2 pt-2 pb-1 text-xs font-medium text-muted-foreground uppercase tracking-wider">{t(($) => $.lead.members_group)}</div>
-                      {filteredMembers.map((m) => (
-                        <button
-                          type="button"
-                          key={m.user_id}
-                          onClick={() => { handleUpdateField({ lead_type: "member", lead_id: m.user_id }); setLeadOpen(false); }}
-                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent transition-colors"
-                        >
-                          <ActorAvatar actorType="member" actorId={m.user_id} size={16} />
-                          <span>{m.name}</span>
-                        </button>
-                      ))}
-                    </>
                   )}
-                  {filteredAgents.length > 0 && (
-                    <>
-                      <div className="px-2 pt-2 pb-1 text-xs font-medium text-muted-foreground uppercase tracking-wider">{t(($) => $.lead.agents_group)}</div>
-                      {filteredAgents.map((a) => (
-                        <button
-                          type="button"
-                          key={a.id}
-                          onClick={() => { handleUpdateField({ lead_type: "agent", lead_id: a.id }); setLeadOpen(false); }}
-                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent transition-colors"
-                        >
-                          <ActorAvatar actorType="agent" actorId={a.id} size={16} showStatusDot />
-                          <span>{a.name}</span>
-                        </button>
-                      ))}
-                    </>
-                  )}
-                  {filteredMembers.length === 0 && filteredAgents.length === 0 && leadFilter && (
-                    <div className="px-2 py-3 text-center text-sm text-muted-foreground">{t(($) => $.lead.no_results)}</div>
-                  )}
-                </div>
-              </PopoverContent>
-            </Popover>
+                </button>
+              )}
+            />
           </PropRow>
+          <PropRow label={t(($) => $.detail.prop_start_date)}>
+            <ProjectStartDatePicker startDate={project.start_date} onUpdate={handleUpdateField} />
+          </PropRow>
+          <PropRow label={t(($) => $.detail.prop_due_date)}>
+            <ProjectDueDatePicker dueDate={project.due_date} onUpdate={handleUpdateField} />
+          </PropRow>
+          <ProjectWorkflowPropRow project={project} onOpen={openWorkflowSheet} />
+          {archived && (
+            <PropRow label={t(($) => $.archive.prop_label)}>
+              <span className="tabular-nums">{formatRelativeDate(project.archived_at!)}</span>
+              {project.archived_by_type && project.archived_by_id && (
+                <>
+                  <span className="text-muted-foreground">·</span>
+                  <ActorAvatar actorType={project.archived_by_type} actorId={project.archived_by_id} size="sm" enableHoverCard />
+                  <span className="truncate">{getActorName(project.archived_by_type, project.archived_by_id)}</span>
+                </>
+              )}
+            </PropRow>
+          )}
         </div>}
       </div>
 
@@ -598,7 +466,8 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
         return (
           <div>
             <button
-              className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors mb-2 hover:bg-accent/70 ${progressOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
+              type="button"
+              className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-caption font-medium transition-colors mb-2 hover:bg-accent/70 ${progressOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
               onClick={() => setProgressOpen(!progressOpen)}
             >
               {t(($) => $.detail.section_progress)}
@@ -611,7 +480,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
                   style={{ width: `${pct}%` }}
                 />
               </div>
-              <span className="text-xs text-muted-foreground tabular-nums shrink-0">
+              <span className="text-caption text-muted-foreground tabular-nums shrink-0">
                 {issueMetrics.completedCount}/{issueMetrics.totalCount}
               </span>
             </div>}
@@ -622,7 +491,8 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
       {/* Description */}
       <div>
         <button
-          className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors mb-2 hover:bg-accent/70 ${descriptionOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
+          type="button"
+          className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-caption font-medium transition-colors mb-2 hover:bg-accent/70 ${descriptionOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
           onClick={() => setDescriptionOpen(!descriptionOpen)}
         >
           {t(($) => $.detail.section_description)}
@@ -632,11 +502,14 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
           <ContentEditor
             ref={descEditorRef}
             key={projectId}
-            defaultValue={project.description || ""}
+            value={project.description || ""}
             placeholder={t(($) => $.detail.description_placeholder)}
             onUpdate={(md) => handleUpdateField({ description: md || null })}
             debounceMs={1500}
           />
+          <p className="mt-1 px-2 text-caption text-muted-foreground">
+            {t(($) => $.detail.description_hint)}
+          </p>
         </div>}
       </div>
 
@@ -647,112 +520,152 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
 
   return (
     <>
-    <ResizablePanelGroup orientation="horizontal" className="flex-1 min-h-0" defaultLayout={defaultLayout} onLayoutChanged={onLayoutChanged}>
+    <ResizablePanelGroup
+      data-mc="object-page"
+      data-type="project"
+      orientation="horizontal"
+      className="flex-1 min-h-0"
+      defaultLayout={defaultLayout}
+      onLayoutChanged={onLayoutChanged}
+    >
       <ResizablePanel id="content" minSize="50%">
-        <div className="flex h-full flex-col">
-          <PageHeader className="gap-2 bg-background text-sm">
-            <div className="flex flex-1 items-center gap-1.5 min-w-0">
-              <AppLink href={wsPaths.projects()} className="text-muted-foreground hover:text-foreground transition-colors shrink-0">
-                {workspaceName ?? t(($) => $.detail.breadcrumb_fallback)}
-              </AppLink>
-              <ChevronRight className="h-3 w-3 text-muted-foreground/50 shrink-0" />
-              <span className="truncate">{project.title}</span>
-            </div>
-            <div className="flex items-center gap-1 shrink-0">
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                className={cn("text-muted-foreground", isPinned && "text-foreground")}
-                title={isPinned ? t(($) => $.detail.unpin_tooltip) : t(($) => $.detail.pin_tooltip)}
-                onClick={() => {
-                  if (isPinned) {
-                    deletePinMut.mutate({ itemType: "project", itemId: projectId });
-                  } else {
-                    createPin.mutate({ item_type: "project", item_id: projectId });
-                  }
-                }}
-              >
-                {isPinned ? <PinOff /> : <Pin />}
-              </Button>
-              <DropdownMenu>
-                <DropdownMenuTrigger
-                  render={
-                    <Button variant="ghost" size="icon-sm" className="text-muted-foreground">
-                      <MoreHorizontal />
-                    </Button>
-                  }
-                />
-                <DropdownMenuContent align="end" className="w-auto">
-                  <DropdownMenuItem onClick={() => {
-                    navigator.clipboard.writeText(window.location.href);
-                    toast.success(t(($) => $.detail.toast_link_copied));
-                  }}>
-                    <Link2 className="h-3.5 w-3.5" />
-                    {t(($) => $.detail.copy_link)}
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    variant="destructive"
-                    onClick={() => setDeleteDialogOpen(true)}
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                    {t(($) => $.detail.delete_action)}
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      variant={sidebarOpen ? "secondary" : "ghost"}
-                      size="icon-sm"
-                      className={sidebarOpen ? "" : "text-muted-foreground"}
-                      onClick={() => {
-                        if (isMobile) {
-                          setMobileSidebarOpen((open) => !open);
-                        } else {
-                          const panel = sidebarRef.current;
-                          if (!panel) return;
-                          if (panel.isCollapsed()) panel.expand();
-                          else panel.collapse();
-                        }
-                      }}
+        <div ref={rightSidebarShortcutTargetRef} className="flex h-full flex-col">
+          <IssueSurface
+            scope={issueScope}
+            modes={["board", "list", "table", "swimlane", "gantt"]}
+            allowCreate={!archived}
+            renderHeader={({ controller }) => (
+              <>
+              <IssueViewHeader
+                controller={controller}
+                base={{ kind: "project", project }}
+                baseBadge={archived ? <ArchivedProjectTag /> : undefined}
+                hideCreate={archived}
+                baseMenu={
+                  <>
+                    <DropdownMenuItem
+                      onClick={() =>
+                        useModalStore
+                          .getState()
+                          .open("project-rename", { projectId: project.id, title: project.title })
+                      }
                     >
-                      <PanelRight />
-                    </Button>
-                  }
-                />
-                <TooltipContent side="bottom">{t(($) => $.detail.sidebar_tooltip)}</TooltipContent>
-              </Tooltip>
-            </div>
-          </PageHeader>
-
-          <ViewStoreProvider store={projectViewStore}>
-              <ProjectIssuesSurface
-                projectId={projectId}
-                scope={projectScope}
-                filter={projectFilter}
+                      <Pencil className="h-3.5 w-3.5" />
+                      {t(($) => $.detail.rename_action)}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => {
+                      void copyText(router.getShareableUrl(currentPath(router))).then((ok) => {
+                        if (ok) toast.success(t(($) => $.detail.toast_link_copied));
+                      });
+                    }}>
+                      <Link2 className="h-3.5 w-3.5" />
+                      {t(($) => $.detail.copy_link)}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => {
+                      const { text, html } = titleLinkPayload(
+                        project.title,
+                        router.getShareableUrl(currentPath(router)),
+                      );
+                      void copyTextAndHtml(text, html).then((ok) => {
+                        if (ok) {
+                          toast.success(t(($) => $.detail.toast_title_link_copied));
+                        } else {
+                          toast.error(t(($) => $.detail.toast_title_link_copy_failed));
+                        }
+                      });
+                    }}>
+                      <Type className="h-3.5 w-3.5" />
+                      {t(($) => $.detail.copy_title_as_link)}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => {
+                      if (isPinned) {
+                        deletePinMut.mutate({ itemType: "project", itemId: projectId });
+                      } else {
+                        createPin.mutate({ item_type: "project", item_id: projectId });
+                      }
+                    }}>
+                      {isPinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
+                      {isPinned ? t(($) => $.detail.unpin_tooltip) : t(($) => $.detail.pin_tooltip)}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      disabled={setSubscription.isPending}
+                      onClick={handleToggleSubscription}
+                    >
+                      {isSubscribed ? <BellOff className="h-3.5 w-3.5" /> : <BellRing className="h-3.5 w-3.5" />}
+                      {isSubscribed ? t(($) => $.detail.unsubscribe_action) : t(($) => $.detail.subscribe_action)}
+                    </DropdownMenuItem>
+                    <ProjectWorkflowMenuItem project={project} onOpen={() => setWorkflowSheetOpen(true)} />
+                    <DropdownMenuSeparator />
+                    {archived ? (
+                      <DropdownMenuItem onClick={() => restore(project)}>
+                        <ArchiveRestore className="h-3.5 w-3.5" />
+                        {t(($) => $.detail.restore_action)}
+                      </DropdownMenuItem>
+                    ) : (
+                      <DropdownMenuItem onClick={() => requestArchive([project])}>
+                        <Archive className="h-3.5 w-3.5" />
+                        {t(($) => $.detail.archive_action)}
+                      </DropdownMenuItem>
+                    )}
+                    {canDelete && (
+                      <DropdownMenuItem
+                        variant="destructive"
+                        disabled={deleting}
+                        aria-busy={deleting}
+                        onClick={() => setDeleteDialogOpen(true)}
+                      >
+                        {deleting ? <Spinner className="size-3.5" aria-hidden="true" /> : <Trash2 className="h-3.5 w-3.5" />}
+                        {t(($) => $.detail.delete_action)}
+                      </DropdownMenuItem>
+                    )}
+                  </>
+                }
+                trailing={
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <Button
+                          variant={sidebarOpen ? "secondary" : "ghost"}
+                          size="icon-sm"
+                          className={sidebarOpen ? "" : "text-muted-foreground"}
+                          aria-label={t(($) => $.detail.sidebar_tooltip)}
+                          onClick={handleToggleSidebar}
+                        >
+                          <PanelRight />
+                        </Button>
+                      }
+                    />
+                    <TooltipContent side="bottom">{t(($) => $.detail.sidebar_tooltip)}</TooltipContent>
+                  </Tooltip>
+                }
               />
-            </ViewStoreProvider>
+              {archived && (
+                <div className={cn("shrink-0 pt-2", PAGE_GUTTER)}>
+                  <ArchivedProjectNotice project={project} />
+                </div>
+              )}
+              </>
+            )}
+          />
           </div>
         </ResizablePanel>
         {!isMobile && <ResizableHandle />}
         {!isMobile && (
         <ResizablePanel
           id="sidebar"
+          {...rightSidebarPanelMotionProps}
+          data-right-sidebar-motion={desktopSidebarMotionEnabled ? "enabled" : undefined}
           defaultSize={desktopSidebarOpen ? 320 : 0}
           minSize={260}
           maxSize={420}
           collapsible
           groupResizeBehavior="preserve-pixel-size"
           panelRef={sidebarRef}
-          onResize={(size) => setDesktopSidebarOpen(size.inPixels > 0)}
+          onResize={handleDesktopSidebarResize}
         >
-          <div className="overflow-y-auto border-l h-full">
-            <div className="p-4">
-              {sidebarContent}
-            </div>
-          </div>
+          <AnimatedRightSidebar open={desktopSidebarVisualOpen} motionEnabled={desktopSidebarMotionEnabled}>
+            {sidebarContent}
+          </AnimatedRightSidebar>
         </ResizablePanel>
         )}
         {isMobile && (
@@ -764,23 +677,63 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
         )}
       </ResizablePanelGroup>
 
+      <ProjectWorkflowSheet project={project} open={workflowSheetOpen} onOpenChange={setWorkflowSheetOpen} />
+      {archiveDialog}
+
       {/* Delete confirmation */}
-      <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{t(($) => $.delete_dialog.title)}</AlertDialogTitle>
-            <AlertDialogDescription>
-              {t(($) => $.delete_dialog.description)}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>{t(($) => $.delete_dialog.cancel)}</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDelete} className="bg-destructive text-white hover:bg-destructive/90">
-              {t(($) => $.delete_dialog.confirm)}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      {canDelete && (
+        <AlertDialog
+          open={deleteDialogOpen}
+          onOpenChange={(open) => {
+            if (!deleting) setDeleteDialogOpen(open);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{t(($) => $.delete_dialog.title)}</AlertDialogTitle>
+              <AlertDialogDescription>
+                {t(($) => $.delete_dialog.description)}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            {!archived && (
+              <div className="flex items-start gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-caption text-muted-foreground">
+                <Archive className="mt-0.5 size-3.5 shrink-0" />
+                <span>{t(($) => $.delete_dialog.archive_hint)}</span>
+              </div>
+            )}
+            <AlertDialogFooter>
+              {!archived && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="sm:mr-auto"
+                  disabled={deleting}
+                  onClick={() => {
+                    setDeleteDialogOpen(false);
+                    requestArchive([project], { immediate: true });
+                  }}
+                >
+                  <Archive className="size-3.5" />
+                  {t(($) => $.delete_dialog.archive_instead)}
+                </Button>
+              )}
+              <AlertDialogCancel disabled={deleting}>
+                {t(($) => $.delete_dialog.cancel)}
+              </AlertDialogCancel>
+              <AlertDialogAction
+                disabled={deleting}
+                aria-busy={deleting}
+                onClick={handleDelete}
+                className="bg-destructive text-white hover:bg-destructive/90"
+              >
+                {deleting && <Spinner className="size-3.5" aria-hidden="true" />}
+                {t(($) => $.delete_dialog.confirm)}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
     </>
   );
 }

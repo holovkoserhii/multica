@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -168,7 +170,7 @@ func runIssueMetadataList(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
 	issueRef, err := resolveIssueRef(ctx, client, args[0])
@@ -178,6 +180,26 @@ func runIssueMetadataList(cmd *cobra.Command, args []string) error {
 
 	var result map[string]any
 	if err := client.GetJSON(ctx, "/api/issues/"+issueRef.ID+"/metadata", &result); err != nil {
+		// Best-effort degradation: when the server does not expose the
+		// per-issue metadata endpoint (self-hosted backends running an
+		// older build, missing migration, or routing issues that surface
+		// as 404), an agent's bootstrap "metadata list" must not fail
+		// the entire run. Emit an empty map and exit 0 so the agent
+		// still gets the empty-metadata signal it would have gotten on
+		// a fresh issue. Other status codes (auth, server errors) keep
+		// real error semantics, and metadata get/set/delete are
+		// unaffected — those callers still need to know when something
+		// went wrong.
+		var httpErr *cli.HTTPError
+		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+			output, _ := cmd.Flags().GetString("output")
+			empty := map[string]any{}
+			if output == "json" {
+				return cli.PrintJSON(os.Stdout, empty)
+			}
+			printMetadataTable(empty)
+			return nil
+		}
 		return fmt.Errorf("list metadata: %w", err)
 	}
 	metadata, _ := result["metadata"].(map[string]any)
@@ -199,7 +221,7 @@ func runIssueMetadataGet(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
 	issueRef, err := resolveIssueRef(ctx, client, args[0])
@@ -227,10 +249,21 @@ func runIssueMetadataGet(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runIssueMetadataSet(cmd *cobra.Command, args []string) error {
-	key, _ := cmd.Flags().GetString("key")
+func validateIssueMetadataPathKey(key string) error {
 	if key == "" {
 		return fmt.Errorf("--key is required")
+	}
+	// PathEscape leaves dot segments unchanged; proxies can normalize them to another endpoint.
+	if key == "." || key == ".." {
+		return fmt.Errorf("key must match ^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$")
+	}
+	return nil
+}
+
+func runIssueMetadataSet(cmd *cobra.Command, args []string) error {
+	key, _ := cmd.Flags().GetString("key")
+	if err := validateIssueMetadataPathKey(key); err != nil {
+		return err
 	}
 	if !cmd.Flags().Changed("value") {
 		return fmt.Errorf("--value is required")
@@ -246,7 +279,7 @@ func runIssueMetadataSet(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
 	issueRef, err := resolveIssueRef(ctx, client, args[0])
@@ -256,7 +289,7 @@ func runIssueMetadataSet(cmd *cobra.Command, args []string) error {
 
 	body := map[string]any{"value": value}
 	var result map[string]any
-	path := "/api/issues/" + issueRef.ID + "/metadata/" + key
+	path := "/api/issues/" + issueRef.ID + "/metadata/" + url.PathEscape(key)
 	if err := client.PutJSON(ctx, path, body, &result); err != nil {
 		return fmt.Errorf("set metadata: %w", err)
 	}
@@ -272,15 +305,15 @@ func runIssueMetadataSet(cmd *cobra.Command, args []string) error {
 
 func runIssueMetadataDelete(cmd *cobra.Command, args []string) error {
 	key, _ := cmd.Flags().GetString("key")
-	if key == "" {
-		return fmt.Errorf("--key is required")
+	if err := validateIssueMetadataPathKey(key); err != nil {
+		return err
 	}
 
 	client, err := newAPIClient(cmd)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
 	issueRef, err := resolveIssueRef(ctx, client, args[0])
@@ -288,7 +321,7 @@ func runIssueMetadataDelete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolve issue: %w", err)
 	}
 
-	path := "/api/issues/" + issueRef.ID + "/metadata/" + key
+	path := "/api/issues/" + issueRef.ID + "/metadata/" + url.PathEscape(key)
 	if err := client.DeleteJSON(ctx, path); err != nil {
 		return fmt.Errorf("delete metadata: %w", err)
 	}

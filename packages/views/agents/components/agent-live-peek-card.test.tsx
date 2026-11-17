@@ -22,6 +22,12 @@ vi.mock("@multica/core/paths", () => ({
   }),
 }));
 
+vi.mock("@multica/core/api", () => ({
+  api: {
+    getBaseUrl: () => "http://127.0.0.1:8080",
+  },
+}));
+
 // AppLink is just a plain anchor here — wiring the navigation adapter would
 // add nothing to these assertions.
 vi.mock("../../navigation", () => ({
@@ -107,9 +113,7 @@ function makeAgent(overrides: Record<string, unknown> = {}) {
     avatar_url: null,
     runtime_mode: "local" as const,
     runtime_config: {},
-    custom_env: {},
     custom_args: [],
-    custom_env_redacted: false,
     visibility: "private" as const,
     status: "idle" as const,
     max_concurrent_tasks: 1,
@@ -246,6 +250,36 @@ describe("AgentLivePeekCard", () => {
     renderCard();
 
     expect(screen.getByText("Idle")).toBeInTheDocument();
+    expect(screen.getByText(enAgents.live_peek.failed_indicator)).toBeInTheDocument();
+  });
+
+  it("ignores cancelled tasks when picking last activity", () => {
+    mockPresence.current = {
+      availability: "online",
+      workload: "idle",
+      runningCount: 0,
+      queuedCount: 0,
+      capacity: 1,
+    };
+    // The snapshot endpoint never returns cancelled rows, but the card must
+    // not treat one as an outcome if it ever does: cancel is a procedural
+    // signal, so a newer cancellation must not mask the older real failure.
+    mockSnapshot.current = [
+      makeTask({
+        id: "task-failed",
+        status: "failed",
+        completed_at: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      }),
+      makeTask({
+        id: "task-cancelled",
+        status: "cancelled",
+        completed_at: new Date(Date.now() - 1 * 60 * 1000).toISOString(),
+      }),
+    ];
+
+    renderCard();
+
+    expect(screen.getByText(/10m ago/)).toBeInTheDocument();
     expect(screen.getByText(enAgents.live_peek.failed_indicator)).toBeInTheDocument();
   });
 });

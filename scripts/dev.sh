@@ -13,7 +13,7 @@ command -v docker >/dev/null 2>&1 || missing+=("docker")
 
 if [ ${#missing[@]} -gt 0 ]; then
   echo "✗ Missing prerequisites: ${missing[*]}"
-  echo "  Please install: Node.js v20+, pnpm v10.28+, Go v1.26+, Docker"
+  echo "  Please install: Node.js 22, pnpm 10.28.2, Go 1.26.9, Docker"
   exit 1
 fi
 
@@ -39,6 +39,9 @@ set -a
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 set +a
+
+# shellcheck disable=SC1091
+. scripts/local-env.sh
 
 # ---------- Install dependencies ----------
 if [ ! -d node_modules ]; then

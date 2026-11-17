@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -61,7 +60,7 @@ func runIssueLabelList(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
 	issueRef, err := resolveIssueRef(ctx, client, args[0])
@@ -89,14 +88,14 @@ func runIssueLabelAdd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
 	issueRef, err := resolveIssueRef(ctx, client, args[0])
 	if err != nil {
 		return fmt.Errorf("resolve issue: %w", err)
 	}
-	labelRef, err := resolveLabelID(ctx, client, args[1])
+	labelRef, err := resolveLabelID(ctx, client, args[1], "issue")
 	if err != nil {
 		return fmt.Errorf("resolve label: %w", err)
 	}
@@ -106,9 +105,17 @@ func runIssueLabelAdd(cmd *cobra.Command, args []string) error {
 	if err := client.PostJSON(ctx, "/api/issues/"+issueRef.ID+"/labels", body, &result); err != nil {
 		return fmt.Errorf("attach label: %w", err)
 	}
-	labelsRaw, _ := result["labels"].([]any)
+	labelsRaw, ok := result["labels"].([]any)
 
 	output, _ := cmd.Flags().GetString("output")
+	// The attachment can succeed even when the server cannot read back the list.
+	if !ok {
+		if output == "json" {
+			return cli.PrintJSON(os.Stdout, map[string]any{"attached": true})
+		}
+		fmt.Fprintln(os.Stdout, "Label attached.")
+		return nil
+	}
 	if output == "json" {
 		return cli.PrintJSON(os.Stdout, labelsRaw)
 	}
@@ -122,14 +129,14 @@ func runIssueLabelRemove(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := cli.APIContext(context.Background())
 	defer cancel()
 
 	issueRef, err := resolveIssueRef(ctx, client, args[0])
 	if err != nil {
 		return fmt.Errorf("resolve issue: %w", err)
 	}
-	labelRef, err := resolveLabelID(ctx, client, args[1])
+	labelRef, err := resolveLabelID(ctx, client, args[1], "issue")
 	if err != nil {
 		return fmt.Errorf("resolve label: %w", err)
 	}

@@ -5,25 +5,85 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// TestMemberAllowedForPrivateAgent_Pure exercises the pure predicate that
-// drives the private-agent gate. The gate must allow:
+func TestDeriveAgentRuntimeAvailability(t *testing.T) {
+	now := time.Date(2026, time.April, 27, 12, 0, 0, 0, time.UTC)
+	timestamp := func(at time.Time) pgtype.Timestamptz {
+		return pgtype.Timestamptz{Time: at, Valid: true}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		status string
+		seen   pgtype.Timestamptz
+		want   string
+	}{
+		{name: "online", status: "online", want: "online"},
+		{name: "recent loss", status: "offline", seen: timestamp(now.Add(-time.Minute)), want: "unstable"},
+		{name: "offline", status: "offline", seen: timestamp(now.Add(-10 * time.Minute)), want: "offline"},
+		{name: "missing heartbeat", status: "offline", want: "offline"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveAgentRuntimeAvailability(db.AgentRuntime{
+				Status:     tc.status,
+				LastSeenAt: tc.seen,
+			}, now)
+			if got != tc.want {
+				t.Fatalf("deriveAgentRuntimeAvailability = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadAgentRuntimeAvailability_PrivilegedViewerSkipsRuntimeQuery(t *testing.T) {
+	h := &Handler{}
+	agents := []db.Agent{{
+		RuntimeID: util.MustParseUUID("11111111-1111-1111-1111-111111111111"),
+	}}
+
+	for _, role := range []string{"owner", "admin"} {
+		t.Run(role, func(t *testing.T) {
+			got, err := h.loadAgentRuntimeAvailability(
+				context.Background(),
+				agents,
+				"22222222-2222-2222-2222-222222222222",
+				"33333333-3333-3333-3333-333333333333",
+				role,
+				time.Now(),
+			)
+			if err != nil {
+				t.Fatalf("loadAgentRuntimeAvailability: %v", err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("availability = %v, want empty for %s", got, role)
+			}
+		})
+	}
+}
+
+// TestMemberAllowedToViewAgent_Pure exercises the pure predicate that drives
+// the private-agent VIEW gate. For a private agent it must allow:
 //   - workspace owner / admin (regardless of agent ownership)
 //   - the agent owner (regardless of role)
 //
 // And deny everyone else. This test runs without a database.
-func TestMemberAllowedForPrivateAgent_Pure(t *testing.T) {
+func TestMemberAllowedToViewAgent_Pure(t *testing.T) {
 	ownerUserID := "11111111-1111-1111-1111-111111111111"
 	otherUserID := "22222222-2222-2222-2222-222222222222"
 
 	agent := db.Agent{
-		OwnerID: util.MustParseUUID(ownerUserID),
+		OwnerID:        util.MustParseUUID(ownerUserID),
+		PermissionMode: "private",
 	}
 
 	cases := []struct {
@@ -41,9 +101,9 @@ func TestMemberAllowedForPrivateAgent_Pure(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := memberAllowedForPrivateAgent(agent, tc.userID, tc.role)
+			got := memberAllowedToViewAgent(agent, nil, tc.userID, tc.role)
 			if got != tc.want {
-				t.Fatalf("memberAllowedForPrivateAgent(userID=%s, role=%s) = %v; want %v",
+				t.Fatalf("memberAllowedToViewAgent(userID=%s, role=%s) = %v; want %v",
 					tc.userID, tc.role, got, tc.want)
 			}
 		})
@@ -59,6 +119,20 @@ func privateAgentTestFixture(t *testing.T) (agentID, ownerID, memberID string) {
 	t.Helper()
 
 	ctx := context.Background()
+	// Keep these permission-focused fixtures out of the private-runtime owner
+	// fence. Their agents remain private; the public runtime isolates invocation
+	// authorization from the separate runtime/agent ownership rule.
+	runtimeID := handlerTestRuntimeID(t)
+	var runtimeVisibility string
+	if err := testPool.QueryRow(ctx, `SELECT visibility FROM agent_runtime WHERE id = $1`, runtimeID).Scan(&runtimeVisibility); err != nil {
+		t.Fatalf("read fixture runtime visibility: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE agent_runtime SET visibility = 'public' WHERE id = $1`, runtimeID); err != nil {
+		t.Fatalf("make fixture runtime public: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `UPDATE agent_runtime SET visibility = $1 WHERE id = $2`, runtimeVisibility, runtimeID)
+	})
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO "user" (name, email)
 		VALUES ('Private Agent Owner', 'private-agent-owner@multica.test')
@@ -106,7 +180,7 @@ func privateAgentTestFixture(t *testing.T) (agentID, ownerID, memberID string) {
 		VALUES ($1, 'private-access-test-agent', '', 'cloud', '{}'::jsonb,
 		        $2, 'private', 1, $3, '', '{}'::jsonb, '[]'::jsonb)
 		RETURNING id
-	`, testWorkspaceID, handlerTestRuntimeID(t), ownerID).Scan(&agentID); err != nil {
+	`, testWorkspaceID, runtimeID, ownerID).Scan(&agentID); err != nil {
 		t.Fatalf("create private agent: %v", err)
 	}
 	t.Cleanup(func() {
@@ -140,6 +214,13 @@ func TestGetAgent_PrivateAgentForbidsPlainMember(t *testing.T) {
 	testHandler.GetAgent(w, withURLParam(newRequest("GET", "/api/agents/"+agentID, nil), "id", agentID))
 	if w.Code != http.StatusOK {
 		t.Fatalf("GetAgent as workspace owner: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var ownerResponse map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &ownerResponse); err != nil {
+		t.Fatalf("decode GetAgent owner response: %v", err)
+	}
+	if _, ok := ownerResponse["runtime_availability"]; ok {
+		t.Fatal("runtime_availability should be omitted when the viewer owns the runtime")
 	}
 
 	// Agent owner (plain member who happens to own the agent): allowed.
@@ -186,6 +267,117 @@ func TestListAgents_FiltersPrivateForPlainMember(t *testing.T) {
 	}
 	if listContainsAgent(t, w.Body.Bytes(), agentID) {
 		t.Fatalf("ListAgents as plain member leaked private agent %s", agentID)
+	}
+}
+
+// TestListAgents_SharedAgentCarriesPrivateRuntimeAvailability verifies the
+// privacy-safe bridge used by presence derivation: a member may see a shared
+// agent's coarse runtime availability even when that private runtime is absent
+// from their runtime list, but no runtime detail fields are added to the agent
+// response.
+func TestListAgents_SharedAgentCarriesPrivateRuntimeAvailability(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	runtimeID, runtimeOwnerID, memberID := runtimeVisibilityFixture(t)
+	agentID := dbfx.Agent(t, "shared-private-runtime-agent", runtimeID, testutil.Cols{
+		"visibility":      "workspace",
+		"permission_mode": "public_to",
+		"owner_id":        runtimeOwnerID,
+	})
+	dbfx.Insert(t, "agent_invocation_target", testutil.Cols{
+		"agent_id":    agentID,
+		"target_type": "workspace",
+		"target_id":   testWorkspaceID,
+	})
+
+	listResponse := testutil.Call(t, testHandler.ListAgents,
+		newRequestAs(memberID, "GET", "/api/agents", nil)).Want(http.StatusOK)
+
+	var responses []AgentResponse
+	listResponse.JSON(&responses)
+	var shared *AgentResponse
+	for i := range responses {
+		if responses[i].ID == agentID {
+			shared = &responses[i]
+			break
+		}
+	}
+	if shared == nil {
+		t.Fatalf("shared agent %s missing from member list", agentID)
+	}
+	if shared.RuntimeAvailability != "online" {
+		t.Fatalf("runtime_availability = %q, want online", shared.RuntimeAvailability)
+	}
+	var wire []map[string]json.RawMessage
+	listResponse.JSON(&wire)
+	for _, item := range wire {
+		if string(item["id"]) != strconv.Quote(agentID) {
+			continue
+		}
+		for _, field := range []string{
+			"device_info",
+			"metadata",
+			"daemon_id",
+			"runtime_status",
+			"runtime_last_seen_at",
+		} {
+			if _, ok := item[field]; ok {
+				t.Errorf("agent response leaked runtime field %q", field)
+			}
+		}
+		if string(item["runtime_availability"]) != strconv.Quote("online") {
+			t.Errorf("runtime_availability = %s, want online", item["runtime_availability"])
+		}
+	}
+
+	var detail AgentResponse
+	testutil.Call(t, testHandler.GetAgent,
+		withURLParam(newRequestAs(memberID, "GET", "/api/agents/"+agentID, nil), "id", agentID)).
+		Want(http.StatusOK).JSON(&detail)
+	if detail.RuntimeAvailability != "online" {
+		t.Fatalf("GetAgent runtime_availability = %q, want online", detail.RuntimeAvailability)
+	}
+
+	// Archived agents short-circuit presence to "archived" and must not keep
+	// every client polling for a projection it will never consume. Keep an
+	// active sibling on the same runtime so this also catches accidentally
+	// applying a runtime-keyed projection to the archived response.
+	siblingID := dbfx.Agent(t, "active-shared-private-runtime-agent", runtimeID, testutil.Cols{
+		"visibility":      "workspace",
+		"permission_mode": "public_to",
+		"owner_id":        runtimeOwnerID,
+	})
+	dbfx.Insert(t, "agent_invocation_target", testutil.Cols{
+		"agent_id":    siblingID,
+		"target_type": "workspace",
+		"target_id":   testWorkspaceID,
+	})
+	dbfx.Exec(t, `UPDATE agent SET archived_at = now() WHERE id = $1`, agentID)
+
+	archivedList := testutil.Call(t, testHandler.ListAgents,
+		newRequestAs(memberID, "GET", "/api/agents?include_archived=true", nil)).Want(http.StatusOK)
+	var archivedWire []map[string]json.RawMessage
+	archivedList.JSON(&archivedWire)
+	foundArchived := false
+	foundActiveSibling := false
+	for _, item := range archivedWire {
+		switch string(item["id"]) {
+		case strconv.Quote(agentID):
+			foundArchived = true
+			if _, ok := item["runtime_availability"]; ok {
+				t.Fatal("archived agent should not carry runtime_availability")
+			}
+		case strconv.Quote(siblingID):
+			foundActiveSibling = true
+			if string(item["runtime_availability"]) != strconv.Quote("online") {
+				t.Fatalf("active sibling runtime_availability = %s, want online", item["runtime_availability"])
+			}
+		}
+	}
+	if !foundArchived || !foundActiveSibling {
+		t.Fatalf("include_archived list missing agents: archived=%t active_sibling=%t", foundArchived, foundActiveSibling)
 	}
 }
 
@@ -246,11 +438,13 @@ func TestCreateIssue_AssignToPrivateAgentForbidsPlainMember(t *testing.T) {
 		}
 	}
 
-	// Workspace owner (testUserID): allowed.
+	// Workspace owner (testUserID) who is NOT the agent owner: DENIED under
+	// the invocation-permission model (MUL-3963) — admin/owner status no
+	// longer grants the ability to invoke someone else's private agent.
 	w := httptest.NewRecorder()
 	testHandler.CreateIssue(w, newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, body(testUserID)))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("CreateIssue as workspace owner: expected 201, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("CreateIssue as workspace owner (not agent owner): expected 403, got %d: %s", w.Code, w.Body.String())
 	}
 
 	// Agent owner (plain member who happens to own the agent): allowed.
@@ -487,7 +681,7 @@ func TestMentionAgent_RejectsCrossWorkspaceAgentUUID(t *testing.T) {
 		t.Fatalf("count tasks before: %v", err)
 	}
 
-	testHandler.enqueueMentionedAgentTasks(ctx, issue, comment, nil, "member", testUserID)
+	enqueueMentionedAgentTasksForTest(t, ctx, issue, comment, nil, "member", testUserID)
 
 	var afterCount int
 	if err := testPool.QueryRow(ctx,
@@ -499,5 +693,98 @@ func TestMentionAgent_RejectsCrossWorkspaceAgentUUID(t *testing.T) {
 	if afterCount != beforeCount {
 		t.Fatalf("foreign agent task count changed: before=%d after=%d — cross-workspace mention was not rejected",
 			beforeCount, afterCount)
+	}
+}
+
+// TestShouldEnqueueOnComment_PrivateAgentGate is the regression test for
+// GH #3300: after an owner/admin assigns a private agent to an issue, the
+// agent's UUID is "welded" onto that issue and any member with comment
+// access could previously dispatch a new task to the private agent simply by
+// posting a plain (non-@mention) comment, bypassing the visibility gate that
+// #2359 added to chat / @mention / assignment.
+//
+// The gate must (as tightened by MUL-3963 — the cases below are the source of
+// truth, this list only summarises them):
+//   - reject plain workspace members (not owner, not admin, not agent owner)
+//   - allow the agent owner
+//   - reject workspace owners/admins: management access is not invoke access
+//   - reject an agent actor with no owner / allow-listed human originator —
+//     A2A is judged by the top of the chain, never by the immediate agent
+func TestShouldEnqueueOnComment_PrivateAgentGate(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	agentID, ownerID, memberID := privateAgentTestFixture(t)
+
+	// Assign the private agent to a fresh issue. Owner/admin would normally
+	// be the one performing this step; we insert directly so the test
+	// focuses on the on_comment trigger path.
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id,
+		                   assignee_type, assignee_id, number)
+		VALUES ($1, 'on_comment private-agent gate test', 'todo', 'medium', 'member', $2,
+		        'agent', $3,
+		        COALESCE((SELECT MAX(number) FROM issue WHERE workspace_id = $1), 0) + 1)
+		RETURNING id
+	`, testWorkspaceID, testUserID, agentID).Scan(&issueID); err != nil {
+		t.Fatalf("create issue assigned to private agent: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+
+	issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(issueID))
+	if err != nil {
+		t.Fatalf("load issue: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		actorType string
+		actorID   string
+		want      bool
+		reason    string
+	}{
+		{
+			name:      "plain member — denied",
+			actorType: "member",
+			actorID:   memberID,
+			want:      false,
+			reason:    "GH #3300: plain members must not be able to dispatch a task to a private agent via on_comment",
+		},
+		{
+			name:      "agent owner — allowed",
+			actorType: "member",
+			actorID:   ownerID,
+			want:      true,
+			reason:    "agent owner is always in the allowed_principals set",
+		},
+		{
+			name:      "workspace owner — denied (not agent owner)",
+			actorType: "member",
+			actorID:   testUserID,
+			want:      false,
+			reason:    "MUL-3963: workspace owners/admins no longer bypass a private agent's invocation gate",
+		},
+		{
+			name:      "agent-to-agent — denied without allowed originator",
+			actorType: "agent",
+			actorID:   agentID,
+			want:      false,
+			reason:    "MUL-3963: A2A is judged by the top-of-chain originator; a private agent denies an agent actor with no owner/allow-listed originator",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := testHandler.shouldEnqueueAssigneeFallback(ctx, issue, tc.actorType, tc.actorID, commentTriggerComputeOptions{})
+			if got != tc.want {
+				t.Fatalf("%s\n  actor=%s/%s got=%v want=%v",
+					tc.reason, tc.actorType, tc.actorID, got, tc.want)
+			}
+		})
 	}
 }

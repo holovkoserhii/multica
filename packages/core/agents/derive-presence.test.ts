@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 import { describe, expect, it } from "vitest";
 import type { Agent, AgentRuntime, AgentTask } from "../types";
 import {
@@ -19,10 +21,10 @@ function makeAgent(overrides: Partial<Agent> = {}): Agent {
     avatar_url: null,
     runtime_mode: "local",
     runtime_config: {},
-    custom_env: {},
     custom_args: [],
-    custom_env_redacted: false,
     visibility: "workspace",
+    permission_mode: "public_to",
+    invocation_targets: [{ target_type: "workspace", target_id: null }],
     status: "idle",
     max_concurrent_tasks: 6,
     model: "",
@@ -106,10 +108,10 @@ describe("deriveAgentAvailability", () => {
     ).toBe("offline");
   });
 
-  it("collapses about_to_gc into offline (it's a runtime-card concern, not the dot)", () => {
+  it("collapses long_offline into offline (it's a runtime-card concern, not the dot)", () => {
     expect(
       deriveAgentAvailability(
-        // 6.5 days ago — past the 6-day about_to_gc threshold.
+        // 6.5 days ago — past the 6-day long_offline threshold.
         makeRuntime({ status: "offline", last_seen_at: "2026-04-21T00:00:00Z" }),
         NOW,
       ),
@@ -171,6 +173,21 @@ describe("deriveWorkloadDetail", () => {
     expect(r.workload).toBe("queued");
     expect(r.runningCount).toBe(0);
     expect(r.queuedCount).toBe(2);
+  });
+
+  it("counts waiting_local_directory as queued (daemon parked on a path lock)", () => {
+    // waiting_local_directory is the daemon-side "blocked on a busy
+    // local_directory" hold state. It is still on the agent's plate —
+    // the chip must not flip to idle just because the run phase hasn't
+    // started yet — and is grouped with queued/dispatched in the
+    // presence verdict so the user sees "Queued · 1" rather than
+    // "Idle".
+    const r = deriveWorkloadDetail([
+      makeTask({ status: "waiting_local_directory" }),
+    ]);
+    expect(r.workload).toBe("queued");
+    expect(r.runningCount).toBe(0);
+    expect(r.queuedCount).toBe(1);
   });
 
   it("returns working when running coexists with queued (overflow)", () => {
@@ -332,6 +349,24 @@ describe("deriveAgentPresenceDetail", () => {
     });
     expect(detail.capacity).toBe(3);
   });
+
+  it("reports archived over any runtime/task signal for an archived agent", () => {
+    // Archived wins over presence: a leftover online runtime and a running
+    // task must never make a retired agent read as live. Availability
+    // collapses to "archived" and workload is forced idle with zero counts
+    // so no consumer (dot, hover card, list row) can surface "Online" or
+    // "Working" for an archived agent.
+    const detail = deriveAgentPresenceDetail({
+      agent: makeAgent({ archived_at: "2026-04-27T10:00:00Z" }),
+      runtime: makeRuntime(),
+      tasks: [makeTask({ status: "running" })],
+      now: NOW,
+    });
+    expect(detail.availability).toBe("archived");
+    expect(detail.workload).toBe("idle");
+    expect(detail.runningCount).toBe(0);
+    expect(detail.queuedCount).toBe(0);
+  });
 });
 
 describe("buildPresenceMap", () => {
@@ -367,6 +402,39 @@ describe("buildPresenceMap", () => {
     expect(o?.availability).toBe("offline");
     // Workload still resolves independently — running task counts.
     expect(o?.workload).toBe("working");
+  });
+
+  it("uses an agent liveness projection when its private runtime is hidden", () => {
+    const shared = makeAgent({
+      id: "shared",
+      runtime_id: "private-runtime",
+      runtime_availability: "online",
+    });
+    const map = buildPresenceMap({
+      agents: [shared],
+      runtimes: [],
+      snapshot: [makeTask({ agent_id: "shared", status: "running" })],
+      now: NOW,
+    });
+
+    expect(map.get("shared")?.availability).toBe("online");
+    expect(map.get("shared")?.workload).toBe("working");
+  });
+
+  it("keeps a recent loss unstable from a hidden runtime projection", () => {
+    const shared = makeAgent({
+      id: "shared",
+      runtime_id: "private-runtime",
+      runtime_availability: "unstable",
+    });
+    const map = buildPresenceMap({
+      agents: [shared],
+      runtimes: [],
+      snapshot: [],
+      now: NOW,
+    });
+
+    expect(map.get("shared")?.availability).toBe("unstable");
   });
 
   it("threads the same `now` so every agent on a shared runtime gets the same availability", () => {

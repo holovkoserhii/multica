@@ -1,3 +1,14 @@
 export { LocaleProvider, useLocale } from "./context";
-export { locales, localeLabels } from "./types";
-export type { Locale, LandingDict } from "./types";
+export {
+  docsHrefForLocale,
+  isZhLocale,
+  locales,
+  localeLabels,
+  toLandingDictionaryLocale,
+} from "./types";
+export type {
+  DocumentSection,
+  LandingDict,
+  LandingDictionaryLocale,
+  Locale,
+} from "./types";

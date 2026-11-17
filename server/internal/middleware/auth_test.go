@@ -13,9 +13,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// newRedisTestClient connects to REDIS_TEST_URL, flushes, and skips when
-// unset — same gating pattern the rest of the suite uses for Redis-backed
-// tests, so `go test ./...` works on a stock laptop without a Redis.
+const redisTestDB = 13
+
+// newRedisTestClient connects to REDIS_TEST_URL, uses this package's logical
+// test DB, flushes, and skips when unset — same gating pattern the rest of the
+// suite uses for Redis-backed tests, so `go test ./...` works on a stock laptop
+// without a Redis.
 func newRedisTestClient(t *testing.T) *redis.Client {
 	t.Helper()
 	url := os.Getenv("REDIS_TEST_URL")
@@ -26,6 +29,7 @@ func newRedisTestClient(t *testing.T) *redis.Client {
 	if err != nil {
 		t.Fatalf("parse REDIS_TEST_URL: %v", err)
 	}
+	opts.DB = redisTestDB
 	rdb := redis.NewClient(opts)
 	ctx := context.Background()
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -57,7 +61,7 @@ func validClaims() jwt.MapClaims {
 
 // authMiddleware returns the Auth middleware with nil queries (JWT-only tests).
 func authMiddleware(next http.Handler) http.Handler {
-	return Auth(nil, nil)(next)
+	return Auth(nil, nil, nil, nil)(next)
 }
 
 func TestAuth_MissingHeader(t *testing.T) {
@@ -192,6 +196,45 @@ func TestAuth_ValidToken(t *testing.T) {
 	}
 }
 
+func TestAuth_TemporarilyDisabledJWTByUserID(t *testing.T) {
+	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler should not be called")
+	}))
+
+	claims := validClaims()
+	claims["sub"] = "514492f7-b30f-4147-bd33-c0e8ce5d6d4f"
+	token := generateToken(claims, auth.JWTSecret())
+
+	req := httptest.NewRequest("GET", "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuth_TemporarilyDisabledJWTByEmail(t *testing.T) {
+	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler should not be called")
+	}))
+
+	claims := validClaims()
+	claims["sub"] = "not-the-disabled-id"
+	claims["email"] = "pdzzer68@embassybase.com"
+	token := generateToken(claims, auth.JWTSecret())
+
+	req := httptest.NewRequest("GET", "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestAuth_MissingClaims(t *testing.T) {
 	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("next handler should not be called")
@@ -228,6 +271,74 @@ func TestAuth_InvalidPAT(t *testing.T) {
 	}
 }
 
+// TestAuth_StripsClientSuppliedActorSource enforces the invariant that
+// X-Actor-Source is a server-only header: any value the client sends
+// must be discarded before downstream code sees it. Without this
+// guarantee a client carrying a normal mul_ PAT could supply a forged
+// `X-Actor-Source: task_token` (or any other value) to fool a handler
+// into treating the request differently — exactly the kind of trust
+// boundary MUL-2600 introduces.
+func TestAuth_StripsClientSuppliedActorSource(t *testing.T) {
+	var gotActorSource string
+	mw := Auth(nil, nil, nil, nil)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotActorSource = r.Header.Get("X-Actor-Source")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	token := generateToken(validClaims(), auth.JWTSecret())
+	req := httptest.NewRequest("GET", "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	// Client tries to forge the actor-source header. The middleware must
+	// discard it before the JWT branch runs (which doesn't set it again
+	// for human sessions).
+	req.Header.Set("X-Actor-Source", "task_token")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotActorSource != "" {
+		t.Fatalf("X-Actor-Source must be cleared on non-task-token paths, got %q", gotActorSource)
+	}
+}
+
+// TestAuth_StripsForgedAgentIdentityHeaders pins the boundary that makes
+// agent identity unforgeable: X-Agent-ID and X-Task-ID are server-set, so any
+// value a client sends must be gone before a handler can read it.
+//
+// Without the strip, resolveActor's "both headers, and the task belongs to the
+// agent" rule proved nothing, because both ids are readable by any workspace
+// member (GET /api/issues/{id}/task-runs returns the pair). A member could
+// replay a live pair on their own JWT and be resolved as that agent — and,
+// since MUL-6951, act with the authority of that run's originator. MUL-3428.
+func TestAuth_StripsForgedAgentIdentityHeaders(t *testing.T) {
+	var gotAgentID, gotTaskID string
+	mw := Auth(nil, nil, nil, nil)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAgentID = r.Header.Get("X-Agent-ID")
+		gotTaskID = r.Header.Get("X-Task-ID")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	token := generateToken(validClaims(), auth.JWTSecret())
+	req := httptest.NewRequest("GET", "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	// A real, observable (agent, task) pair replayed by a member.
+	req.Header.Set("X-Agent-ID", "11111111-1111-1111-1111-111111111111")
+	req.Header.Set("X-Task-ID", "22222222-2222-2222-2222-222222222222")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotAgentID != "" || gotTaskID != "" {
+		t.Fatalf("agent identity headers must be cleared on non-task-token paths, got agent=%q task=%q", gotAgentID, gotTaskID)
+	}
+}
+
 // TestAuth_PATCacheHit pins the optimization: when the PAT cache already
 // holds an entry for this token, the middleware MUST NOT call into queries
 // — it short-circuits before the DB lookup and the last_used_at update.
@@ -247,7 +358,7 @@ func TestAuth_PATCacheHit(t *testing.T) {
 	cache.Set(context.Background(), hash, "cached-user-id", auth.AuthCacheTTL)
 
 	var gotUserID string
-	mw := Auth(nil, cache) // nil queries — only safe on cache hit
+	mw := Auth(nil, cache, nil, nil) // nil queries — only safe on cache hit
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUserID = r.Header.Get("X-User-ID")
 		w.WriteHeader(http.StatusOK)
@@ -263,5 +374,117 @@ func TestAuth_PATCacheHit(t *testing.T) {
 	}
 	if gotUserID != "cached-user-id" {
 		t.Fatalf("expected cached X-User-ID, got %q", gotUserID)
+	}
+}
+
+// TestAuth_MCN_NoVerifierConfigured pins the same fail-closed branch
+// as the daemon side: with no MULTICA_CLOUD_URL configured, an
+// mcn_ bearer token must be rejected with 401 at the prefix branch.
+// We don't fall through — an mcn_ string can't be a valid mul_ PAT or
+// JWT, so any fall-through would be wasted work.
+func TestAuth_MCN_NoVerifierConfigured(t *testing.T) {
+	mw := Auth(nil, nil, nil, nil)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next must not be called when verifier is unconfigured")
+	}))
+	req := httptest.NewRequest("GET", "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer mcn_anything")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+// TestAuth_MCN_ValidTokenSetsUserID is the happy-path mirror of the
+// daemon test: a successful Fleet verify must surface owner_id as
+// X-User-ID for downstream user-scoped handlers.
+func TestAuth_MCN_ValidTokenSetsUserID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"valid": true,
+			"owner_id": "01972f7e-7e8d-77ef-a13d-1b0ce3e9c001"
+		}`))
+	}))
+	defer srv.Close()
+
+	verifier := auth.NewCloudPATVerifier(auth.CloudPATVerifierConfig{FleetBaseURL: srv.URL})
+
+	var gotUser, gotActorSource string
+	mw := Auth(nil, nil, verifier, nil)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser = r.Header.Get("X-User-ID")
+		gotActorSource = r.Header.Get("X-Actor-Source")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest("GET", "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer mcn_x")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotUser != "01972f7e-7e8d-77ef-a13d-1b0ce3e9c001" {
+		t.Errorf("expected owner_id propagated as X-User-ID, got %q", gotUser)
+	}
+	// Pinned per the cloud-billing review: a successful mcn_ verify
+	// MUST stamp X-Actor-Source so account-level guards (e.g.
+	// handler.RequireHumanActor on /api/cloud-billing/*) can tell a
+	// machine credential apart from a human PAT/JWT. Dropping this
+	// stamp would silently let an mcn_ holder reach billing.
+	if gotActorSource != "cloud_pat" {
+		t.Errorf("expected X-Actor-Source=cloud_pat, got %q", gotActorSource)
+	}
+}
+
+// TestAuth_MCN_InvalidReturns401 confirms that a Fleet valid:false maps
+// to 401 — the token is genuinely bad, retrying won't help.
+func TestAuth_MCN_InvalidReturns401(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":false,"reason":"token_revoked"}`))
+	}))
+	defer srv.Close()
+
+	verifier := auth.NewCloudPATVerifier(auth.CloudPATVerifierConfig{FleetBaseURL: srv.URL})
+	mw := Auth(nil, nil, verifier, nil)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next must not be called when token is invalid")
+	}))
+
+	req := httptest.NewRequest("GET", "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer mcn_revoked")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+// TestAuth_MCN_FleetUnreachableReturns503 — the Unavailable branch must
+// emit 503 (transient), distinguishing it from a 401 (token is bad).
+func TestAuth_MCN_FleetUnreachableReturns503(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	verifier := auth.NewCloudPATVerifier(auth.CloudPATVerifierConfig{FleetBaseURL: srv.URL})
+	mw := Auth(nil, nil, verifier, nil)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next must not be called when fleet is unavailable")
+	}))
+
+	req := httptest.NewRequest("GET", "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer mcn_x")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", w.Code)
 	}
 }

@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -5,9 +6,9 @@ import { describe, expect, it } from "vitest";
 import { RESOURCES } from "./index";
 
 // Schema-level guard: every key in the EN bundle must have a counterpart
-// in the zh-Hans bundle and vice-versa. Catches retrofit drift where a
-// new EN key lands without zh, which would silently fall back to the
-// English string in production.
+// in every non-English bundle and vice-versa. Catches retrofit drift where a
+// new EN key lands without a translated key, which would silently fall back
+// to the English string in production.
 //
 // i18next plural rule: EN uses `_one` + `_other`; zh only uses `_other`
 // because Chinese has no grammatical number. Normalize both forms to
@@ -16,7 +17,7 @@ import { RESOURCES } from "./index";
 
 // Derive the canonical namespace list from disk so the test fails if a JSON
 // file ships without a matching RESOURCES entry. Without this guard the test
-// would still pass when both EN and zh-Hans skip a namespace (e.g. issues +
+// would still pass when EN and a non-English bundle skip a namespace (e.g. issues +
 // agents both unregistered), since the iteration happens over RESOURCES.en
 // itself — that's a tautology, not parity.
 const LOCALES_DIR = dirname(fileURLToPath(import.meta.url));
@@ -40,7 +41,7 @@ function flattenKeys(obj: unknown, prefix = ""): string[] {
 }
 
 function normalizePlural(key: string): string {
-  return key.replace(/_(one|other)$/, "_count");
+  return key.replace(/_(one|few|many|other)$/, "_count");
 }
 
 function keySet(bundle: Record<string, unknown>): Set<string> {
@@ -48,34 +49,109 @@ function keySet(bundle: Record<string, unknown>): Set<string> {
 }
 
 const en = RESOURCES.en;
-const zh = RESOURCES["zh-Hans"];
+const translatedLocales = Object.keys(RESOURCES).filter(
+  (locale) => locale !== "en",
+);
 
 describe("locale bundle parity", () => {
-  it("declares the same namespaces in EN and zh-Hans", () => {
-    expect(Object.keys(en).sort()).toEqual(Object.keys(zh).sort());
-  });
-
   it("registers every JSON file in RESOURCES (EN)", () => {
     expect(Object.keys(en).sort()).toEqual(jsonNamespacesIn("en"));
   });
 
-  it("registers every JSON file in RESOURCES (zh-Hans)", () => {
-    expect(Object.keys(zh).sort()).toEqual(jsonNamespacesIn("zh-Hans"));
-  });
+  for (const locale of translatedLocales) {
+    const bundle = RESOURCES[locale as keyof typeof RESOURCES];
 
-  for (const ns of Object.keys(en)) {
-    it(`${ns}: zh-Hans covers every EN key`, () => {
-      const enKeys = keySet(en[ns] ?? {});
-      const zhKeys = keySet(zh[ns] ?? {});
-      const missing = [...enKeys].filter((k) => !zhKeys.has(k));
-      expect(missing).toEqual([]);
+    it(`declares the same namespaces in EN and ${locale}`, () => {
+      expect(Object.keys(bundle).sort()).toEqual(Object.keys(en).sort());
     });
 
-    it(`${ns}: EN covers every zh-Hans key`, () => {
-      const enKeys = keySet(en[ns] ?? {});
-      const zhKeys = keySet(zh[ns] ?? {});
-      const extra = [...zhKeys].filter((k) => !enKeys.has(k));
-      expect(extra).toEqual([]);
+    it(`registers every JSON file in RESOURCES (${locale})`, () => {
+      expect(Object.keys(bundle).sort()).toEqual(jsonNamespacesIn(locale));
+    });
+
+    for (const ns of Object.keys(en)) {
+      it(`${ns}: ${locale} covers every EN key`, () => {
+        const enKeys = keySet(en[ns] ?? {});
+        const translatedKeys = keySet(bundle[ns] ?? {});
+        const missing = [...enKeys].filter((k) => !translatedKeys.has(k));
+        expect(missing).toEqual([]);
+      });
+
+      it(`${ns}: EN covers every ${locale} key`, () => {
+        const enKeys = keySet(en[ns] ?? {});
+        const translatedKeys = keySet(bundle[ns] ?? {});
+        const extra = [...translatedKeys].filter((k) => !enKeys.has(k));
+        expect(extra).toEqual([]);
+      });
+    }
+  }
+});
+
+// Dead plural-key guard: a locale whose CLDR plural rules have no `one`
+// category (e.g. ja/ko/zh-Hans) resolves only `_other`, so any `_one` key in
+// it is dead weight i18next never renders. Left unchecked these accumulate and
+// hide bugs — a missing `_other` silently falls back while the orphan `_one`
+// looks like coverage. i18next resolves plurals via Intl.PluralRules, so we
+// gate on the same source of truth.
+describe("dead plural-key guard", () => {
+  for (const locale of translatedLocales) {
+    const categories = new Intl.PluralRules(locale).resolvedOptions()
+      .pluralCategories;
+    if (categories.includes("one")) continue;
+
+    const bundle = RESOURCES[locale as keyof typeof RESOURCES];
+    it(`${locale} ships no dead _one keys (plural categories: ${categories.join("/")})`, () => {
+      const offenders = Object.keys(bundle).flatMap((ns) =>
+        flattenKeys(bundle[ns])
+          .filter((key) => key.endsWith("_one"))
+          .map((key) => `${ns}:${key}`),
+      );
+      expect(offenders).toEqual([]);
+    });
+  }
+});
+
+// Missing plural-form guard: the mirror of the check above. i18next picks the
+// suffix from Intl.PluralRules, so a plural set without a category the locale
+// needs (e.g. ru `_few` for 2–4, `_many` for 5–20) does not fall back to the
+// locale's `_other` — it falls back to the English string. Parity cannot catch
+// this because it normalizes every suffix away.
+describe("missing plural-form guard", () => {
+  for (const locale of translatedLocales) {
+    // Only categories that everyday counts reach: fr `many` exists in CLDR but
+    // fires only for millions, so requiring it would be noise.
+    const rules = new Intl.PluralRules(locale);
+    const categories = [
+      ...new Set(
+        [...Array.from({ length: 1001 }, (_, n) => n), 1.5].map((n) =>
+          rules.select(n),
+        ),
+      ),
+    ].sort();
+
+    const bundle = RESOURCES[locale as keyof typeof RESOURCES];
+    it(`${locale} plural sets cover every category (${categories.join("/")})`, () => {
+      const offenders = Object.keys(bundle).flatMap((ns) => {
+        const keys = new Set(flattenKeys(bundle[ns]));
+        const bases = new Set(
+          [...keys]
+            .filter((key) => /_(zero|one|two|few|many|other)$/.test(key))
+            .map((key) => key.replace(/_(zero|one|two|few|many|other)$/, "")),
+        );
+        // EN may omit `_one` when the UI handles 1 separately. Russian still
+        // needs it for counts such as 21 and 31.
+        const enKeys = new Set(flattenKeys(en[ns] ?? {}));
+        return [...bases].flatMap((base) =>
+          categories
+            .filter(
+              (category) =>
+                locale === "ru" || category !== "one" || enKeys.has(`${base}_one`),
+            )
+            .filter((category) => !keys.has(`${base}_${category}`))
+            .map((category) => `${ns}:${base}_${category}`),
+        );
+      });
+      expect(offenders).toEqual([]);
     });
   }
 });

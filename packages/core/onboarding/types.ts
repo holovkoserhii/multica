@@ -1,12 +1,8 @@
 export type OnboardingStep =
   | "welcome"
-  | "source"
-  | "role"
-  | "use_case"
+  | "about_you"
   | "workspace"
-  | "runtime"
-  | "agent"
-  | "first_issue";
+  | "runtime";
 
 /**
  * Exit path from the onboarding flow. Sent to
@@ -27,6 +23,7 @@ export type Source =
   | "social_x"
   | "social_linkedin"
   | "social_youtube"
+  | "social_github"
   | "social_other"
   | "blog_newsletter"
   | "ai_assistant"
@@ -58,23 +55,13 @@ export type UseCase =
   | "other";
 
 /**
- * Questionnaire shape. `source` and `use_case` allow multiple values
- * (users hear about us through several channels and use Multica for
- * several things); `role` stays single-select since the agent template
- * recommendation wants a primary identity.
+ * Questionnaire persistence shared by onboarding and source backfill.
+ * use_case is multi-select; source and role are single-select. Source retains an
+ * array shape for stored compatibility and is collected after agent work completes.
+ * Explicit *_skipped flags distinguish declines from unanswered fields.
  *
- * `*_skipped: true` distinguishes an explicit Skip click from a slot
- * the user never reached. Both states are "unknown" for recommendation
- * purposes; the skip marker exists for analytics and so future
- * re-prompts can avoid nagging users who already declined.
- *
- * Backward compat: prior versions of this app wrote `source` and
- * `use_case` as a single string. `mergeQuestionnaire` in
- * `onboarding-flow.tsx` upgrades those rows to single-element arrays
- * on read; the server's `questionnaireAnswers.UnmarshalJSON` does the
- * same. `version` stays at 2 — the JSONB column is schema-less so a
- * mechanical bump would only show up in analytics, not in storage,
- * and we keep one funnel cohort.
+ * Readers normalize older single-string source/use_case values to arrays.
+ * Version 2 remains the shared analytics cohort; the JSONB storage is schema-less.
  */
 export interface QuestionnaireAnswers {
   source: Source[];

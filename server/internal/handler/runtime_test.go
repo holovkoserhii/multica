@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func TestRuntimeHandlersRejectMalformedRuntimeID(t *testing.T) {
@@ -25,6 +26,12 @@ func TestRuntimeHandlersRejectMalformedRuntimeID(t *testing.T) {
 			handle: testHandler.GetRuntimeUsage,
 		},
 		{
+			name:   "rate limits",
+			method: "GET",
+			path:   "/api/runtimes/not-a-uuid/rate-limits",
+			handle: testHandler.GetRuntimeRateLimits,
+		},
+		{
 			name:   "task activity",
 			method: "GET",
 			path:   "/api/runtimes/not-a-uuid/task-activity",
@@ -35,6 +42,19 @@ func TestRuntimeHandlersRejectMalformedRuntimeID(t *testing.T) {
 			method: "DELETE",
 			path:   "/api/runtimes/not-a-uuid",
 			handle: testHandler.DeleteAgentRuntime,
+		},
+		{
+			name:   "unbind-agents-and-delete",
+			method: "POST",
+			path:   "/api/runtimes/not-a-uuid/unbind-agents-and-delete",
+			handle: testHandler.UnbindAgentsAndDeleteRuntime,
+		},
+		{
+			// Legacy route kept for installed clients; same handler.
+			name:   "archive-agents-and-delete",
+			method: "POST",
+			path:   "/api/runtimes/not-a-uuid/archive-agents-and-delete",
+			handle: testHandler.UnbindAgentsAndDeleteRuntime,
 		},
 		{
 			name:   "models",
@@ -193,6 +213,170 @@ func TestGetRuntimeUsage_BucketsByUsageTime(t *testing.T) {
 	// when ?days=N is interpreted as a rolling window instead of calendar days.
 	if byDate[yesterdayKey] != 2000 {
 		t.Errorf("yesterday morning task: yesterday bucket expected 2000 input tokens, got %d (full map: %v)", byDate[yesterdayKey], byDate)
+	}
+}
+
+// TestListRuntimeUsageByAgent_MergesMixedCaseProvider proves the by-agent
+// query folds historical mixed-case provider rows (written before the handler
+// lowercased provider on write) into a single lowercased bucket via the
+// query's LOWER(provider) normalization, instead of splitting them.
+func TestListRuntimeUsageByAgent_MergesMixedCaseProvider(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	var runtimeID, agentID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT id FROM agent_runtime WHERE workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&runtimeID); err != nil {
+		t.Fatalf("fetch runtime: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		SELECT id FROM agent WHERE workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&agentID); err != nil {
+		t.Fatalf("fetch agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, creator_id, creator_type)
+		VALUES ($1, 'mixed-case provider test', $2, 'member')
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	now := time.Now().UTC()
+	// Two tasks for the same agent/model under this runtime, reporting the
+	// same provider in different casing — 'Cursor' (legacy) and 'cursor' (new).
+	insert := func(provider string, input int64) {
+		var taskID string
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, created_at)
+			VALUES ($1, $2, $3, 'completed', $4)
+			RETURNING id
+		`, agentID, issueID, runtimeID, now).Scan(&taskID); err != nil {
+			t.Fatalf("insert task: %v", err)
+		}
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, created_at)
+			VALUES ($1, $2, 'mixed-case-model', $3, 0, $4)
+		`, taskID, provider, input, now); err != nil {
+			t.Fatalf("insert task_usage: %v", err)
+		}
+		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+	}
+	insert("Cursor", 1000)
+	insert("cursor", 500)
+
+	rows, err := testHandler.Queries.ListRuntimeUsageByAgent(ctx, db.ListRuntimeUsageByAgentParams{
+		RuntimeID: parseUUID(runtimeID),
+		Since:     pgtype.Timestamptz{Time: now.Add(-time.Hour), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("ListRuntimeUsageByAgent: %v", err)
+	}
+
+	var got []db.ListRuntimeUsageByAgentRow
+	for _, r := range rows {
+		if r.Model == "mixed-case-model" {
+			got = append(got, r)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected mixed-case providers to merge into 1 row, got %d: %+v", len(got), got)
+	}
+	if got[0].Provider != "cursor" {
+		t.Errorf("expected merged provider 'cursor', got %q", got[0].Provider)
+	}
+	if got[0].InputTokens != 1500 {
+		t.Errorf("expected merged input_tokens 1500, got %d", got[0].InputTokens)
+	}
+}
+
+// TestGetRuntimeUsageByAgentUsesExactWindow pins the runtime detail page's
+// "Cost by agent" to the same N calendar days as the KPIs above it. The
+// by-agent rows carry no date, so the client cannot trim the extra day
+// parseSinceParamInTZ hands date-bucketed series; the handler has to close
+// the window itself, as the dashboard's per-agent rollups do (MUL-5551).
+func TestGetRuntimeUsageByAgentUsesExactWindow(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	var runtimeID, agentID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT id FROM agent_runtime WHERE workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&runtimeID); err != nil {
+		t.Fatalf("fetch runtime: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		SELECT id FROM agent WHERE workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&agentID); err != nil {
+		t.Fatalf("fetch agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, creator_id, creator_type)
+		VALUES ($1, 'runtime by-agent window test', $2, 'member')
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	// Usage at noon yesterday (UTC), under a model no other fixture uses.
+	// Noon keeps it clear of the midnight edge in either direction.
+	const windowModel = "runtime-exact-window-model"
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, created_at)
+		VALUES ($1, $2, $3, 'completed', now())
+		RETURNING id
+	`, agentID, issueID, runtimeID).Scan(&taskID); err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, created_at)
+		VALUES ($1, 'anthropic', $2, 7777, 0,
+		        (((now() AT TIME ZONE 'UTC')::date - 1)::timestamp + interval '12 hours') AT TIME ZONE 'UTC')
+	`, taskID, windowModel); err != nil {
+		t.Fatalf("insert task_usage: %v", err)
+	}
+
+	seededTokens := func(days string) int64 {
+		w := httptest.NewRecorder()
+		req := newRequest("GET", "/api/runtimes/"+runtimeID+"/usage/by-agent?days="+days+"&tz=UTC", nil)
+		req = withURLParam(req, "runtimeId", runtimeID)
+		testHandler.GetRuntimeUsageByAgent(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("days=%s: expected 200, got %d: %s", days, w.Code, w.Body.String())
+		}
+		var rows []RuntimeUsageByAgentResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &rows); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		var n int64
+		for _, r := range rows {
+			if r.Model == windowModel {
+				n += r.InputTokens
+			}
+		}
+		return n
+	}
+
+	if got := seededTokens("1"); got != 0 {
+		t.Errorf("days=1 must not reach yesterday's tokens, but by-agent counted %d", got)
+	}
+	// days=2 covers today and yesterday, so the row must appear: the window
+	// closed, the fixture is reachable.
+	if got := seededTokens("2"); got != 7777 {
+		t.Errorf("days=2 must include yesterday's 7777 tokens, got %d", got)
 	}
 }
 

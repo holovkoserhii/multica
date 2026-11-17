@@ -1,10 +1,15 @@
 import * as React from 'react'
 import { codeToHtml, bundledLanguages, type BundledLanguage } from 'shiki'
-import { Copy, Check } from "lucide-react"
+import { Copy, Check } from "@multica/ui/icons"
 import { useTranslation } from "react-i18next"
 import { Button } from "@multica/ui/components/ui/button"
 import { Tooltip, TooltipTrigger, TooltipContent } from "@multica/ui/components/ui/tooltip"
 import { cn } from '@multica/ui/lib/utils'
+import { copyText } from '../lib/clipboard'
+import {
+  CODE_LIGATURE_CLASS,
+  CODE_LIGATURE_DESCENDANT_CLASS,
+} from '@multica/ui/lib/code-style'
 
 export interface CodeBlockProps {
   code: string
@@ -130,20 +135,17 @@ export function CodeBlock({
   }, [code, resolvedLang])
 
   const handleCopy = React.useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(code)
+    if (await copyText(code)) {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
-    } catch (err) {
-      console.error('Failed to copy code:', err)
     }
   }, [code])
 
   // Terminal mode: raw monospace with minimal styling
   if (mode === 'terminal') {
     return (
-      <pre className={cn('font-mono text-sm whitespace-pre-wrap', className)}>
-        <code className="font-mono">{code}</code>
+      <pre className={cn('font-mono text-body whitespace-pre-wrap', CODE_LIGATURE_CLASS, className)}>
+        <code className={cn('font-mono', CODE_LIGATURE_CLASS)}>{code}</code>
       </pre>
     )
   }
@@ -152,8 +154,8 @@ export function CodeBlock({
   if (mode === 'minimal') {
     if (isLoading || !highlighted) {
       return (
-        <pre className={cn('font-mono text-sm whitespace-pre-wrap', className)}>
-          <code className="font-mono">{code}</code>
+        <pre className={cn('font-mono text-body whitespace-pre-wrap', CODE_LIGATURE_CLASS, className)}>
+          <code className={cn('font-mono', CODE_LIGATURE_CLASS)}>{code}</code>
         </pre>
       )
     }
@@ -161,7 +163,9 @@ export function CodeBlock({
     return (
       <div
         className={cn(
-          'font-mono text-sm [&_pre]:!bg-transparent [&_pre]:!p-0 [&_pre]:whitespace-pre-wrap [&_pre]:break-all [&_code]:!bg-transparent [&_code]:font-mono [&_pre]:font-mono',
+          'font-mono text-body [&_pre]:!bg-transparent [&_pre]:!p-0 [&_pre]:whitespace-pre-wrap [&_pre]:break-all [&_code]:!bg-transparent [&_code]:font-mono [&_pre]:font-mono',
+          CODE_LIGATURE_CLASS,
+          CODE_LIGATURE_DESCENDANT_CLASS,
           className
         )}
         dangerouslySetInnerHTML={{ __html: highlighted }}
@@ -178,7 +182,7 @@ export function CodeBlock({
       )}
     >
       {/* Language label + copy button */}
-      <div className="flex items-center justify-between px-3 py-1.5 bg-muted/50 border-b text-xs">
+      <div className="flex items-center justify-between px-3 py-1.5 bg-muted/50 border-b text-caption">
         <span className="text-muted-foreground font-medium uppercase tracking-wide">
           {resolvedLang !== 'text' ? resolvedLang : t(($) => $.plain_text)}
         </span>
@@ -207,12 +211,16 @@ export function CodeBlock({
       {/* Code content */}
       <div className="p-3 overflow-x-auto">
         {isLoading || !highlighted ? (
-          <pre className="font-mono text-sm whitespace-pre-wrap break-all">
-            <code className="font-mono">{code}</code>
+          <pre className={cn('font-mono text-body whitespace-pre-wrap break-all', CODE_LIGATURE_CLASS)}>
+            <code className={cn('font-mono', CODE_LIGATURE_CLASS)}>{code}</code>
           </pre>
         ) : (
           <div
-            className="font-mono text-sm [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0 [&_pre]:whitespace-pre-wrap [&_pre]:break-all [&_code]:!bg-transparent [&_code]:font-mono [&_pre]:font-mono"
+            className={cn(
+              'font-mono text-body [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0 [&_pre]:whitespace-pre-wrap [&_pre]:break-all [&_code]:!bg-transparent [&_code]:font-mono [&_pre]:font-mono',
+              CODE_LIGATURE_CLASS,
+              CODE_LIGATURE_DESCENDANT_CLASS
+            )}
             dangerouslySetInnerHTML={{ __html: highlighted }}
           />
         )}
@@ -235,7 +243,8 @@ export function InlineCode({
   return (
     <code
       className={cn(
-        'px-1.5 py-0.5 rounded bg-foreground/[0.03] border border-foreground/[0.05] font-mono text-sm text-foreground/75',
+        'px-1.5 py-0.5 rounded-xs bg-foreground/[0.03] border border-foreground/[0.05] font-mono text-body text-foreground',
+        CODE_LIGATURE_CLASS,
         className
       )}
     >

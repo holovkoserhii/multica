@@ -2,7 +2,10 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import { Markdown } from "@tiptap/markdown";
-import { createMarkdownPasteExtension } from "./markdown-paste";
+import {
+  createMarkdownPasteExtension,
+  escapeRawHtmlTagsOutsideCode,
+} from "./markdown-paste";
 
 interface FakeClipboard {
   files: never[];
@@ -40,6 +43,18 @@ function paste(editor: Editor, text: string, html?: string): boolean {
   );
 }
 
+function pasteThroughEditorDom(editor: Editor, text: string, html: string): void {
+  const event = new Event("paste", { bubbles: false, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: {
+      files: [],
+      getData: (type: string) =>
+        type === "text/plain" ? text : type === "text/html" ? html : "",
+    },
+  });
+  editor.view.dom.dispatchEvent(event);
+}
+
 interface JsonNode {
   type: string;
   text?: string;
@@ -60,6 +75,10 @@ function nodeText(node: JsonNode): string {
   return (node.content ?? []).map(nodeText).join("");
 }
 
+function unescapeMarkdownSyntax(md: string): string {
+  return md.replace(/\\([\\`*_[\]~])/g, "$1");
+}
+
 function expectLiteralPaste(editor: Editor, text: string) {
   editor.commands.setTextSelection(1);
   const parseSpy = vi.spyOn(editor.markdown!, "parse");
@@ -69,7 +88,7 @@ function expectLiteralPaste(editor: Editor, text: string) {
   expect(handled).toBe(true);
   expect(parseSpy).not.toHaveBeenCalled();
   expect(editor.getText()).toBe(text);
-  expect(editor.getMarkdown()).toBe(text);
+  expect(unescapeMarkdownSyntax(editor.getMarkdown())).toBe(text);
 }
 
 describe("markdownPaste — code block context", () => {
@@ -141,6 +160,179 @@ describe("markdownPaste — code block context", () => {
     expect(types).toContain("heading");
   });
 
+  it("lets semantic rich HTML paste natively instead of reparsing plain text as Markdown", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    editor.commands.setTextSelection(1);
+    const parseSpy = vi.spyOn(editor.markdown!, "parse");
+
+    const text =
+      "viewFiltersToApiParams(filters) maps to Partial<ListIssuesParams>.";
+    const html =
+      "<p><code>viewFiltersToApiParams(filters)</code> maps to " +
+      "<code>Partial&lt;ListIssuesParams&gt;</code>.</p>";
+
+    const handled = paste(editor, text, html);
+    expect(handled).toBe(false);
+    expect(parseSpy).not.toHaveBeenCalled();
+  });
+
+  it("lets list and emphasis HTML paste natively", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    editor.commands.setTextSelection(1);
+    const parseSpy = vi.spyOn(editor.markdown!, "parse");
+
+    const handled = paste(
+      editor,
+      "Done\nCreated filters.ts",
+      "<ul><li><strong>Done</strong></li><li>Created filters.ts</li></ul>",
+    );
+
+    expect(handled).toBe(false);
+    expect(parseSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps ordered numbering when rich HTML fragments every item into its own list", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    pasteThroughEditorDom(
+      editor,
+      "1. First\n2. Second\n3. Third",
+      "<ol><li><strong>First</strong></li></ol>" +
+        "<ol><li>Second</li></ol>" +
+        "<ol><li>Third</li></ol>",
+    );
+
+    const json = editor.getJSON() as JsonNode;
+    const orderedLists = (json.content ?? []).filter(
+      (node) => node.type === "orderedList",
+    );
+    expect(orderedLists).toHaveLength(1);
+    expect(orderedLists[0]?.content?.map(nodeText)).toEqual([
+      "First",
+      "Second",
+      "Third",
+    ]);
+    expect(editor.getMarkdown()).toContain(
+      "1. **First**\n2. Second\n3. Third",
+    );
+  });
+
+  it("repairs fragmented ordered lists nested inside another list item", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    pasteThroughEditorDom(
+      editor,
+      "Plan\n1. First\n2. Second",
+      "<ul><li>Plan" +
+        "<ol><li>First</li></ol>" +
+        "<ol><li>Second</li></ol>" +
+        "</li></ul>",
+    );
+
+    const orderedList = findFirst(editor.getJSON() as JsonNode, "orderedList");
+    expect(orderedList?.content?.map(nodeText)).toEqual(["First", "Second"]);
+  });
+
+  it("keeps ordered lists separate when real content divides them", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    pasteThroughEditorDom(
+      editor,
+      "1. First\nSeparate section\n1. Restarted",
+      "<ol><li>First</li></ol>" +
+        "<p>Separate section</p>" +
+        "<ol><li>Restarted</li></ol>",
+    );
+
+    const json = editor.getJSON() as JsonNode;
+    expect(
+      (json.content ?? []).filter((node) => node.type === "orderedList"),
+    ).toHaveLength(2);
+  });
+
+  it("leaves ProseMirror-owned clipboard slices on the native path", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    const handled = paste(
+      editor,
+      "1. First\n1. Restarted",
+      '<div data-pm-slice="0 0 []">' +
+        "<ol><li>First</li></ol>" +
+        "<ol><li>Restarted</li></ol>" +
+        "</div>",
+    );
+
+    expect(handled).toBe(false);
+  });
+
+  it("does not paste rich HTML natively when its text would drop raw tag-like lines", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    editor.commands.setTextSelection(1);
+
+    const text =
+      "<t>\n\n裸 `<tag>` 做转\n\n<tag>\n\n" +
+      "<t>\n\n裸 `<tag>` 做转\n\n<tag>";
+    const html =
+      "<div><t></t></div>" +
+      "<p>裸 <code>&lt;tag&gt;</code> 做转</p>" +
+      "<div><tag></tag></div>" +
+      "<div><t></t></div>" +
+      "<p>裸 <code>&lt;tag&gt;</code> 做转</p>" +
+      "<div><tag></tag></div>";
+
+    const handled = paste(editor, text, html);
+    expect(handled).toBe(true);
+
+    const editorText = editor.getText();
+    expect(editorText.match(/<t>/g)).toHaveLength(2);
+    expect(editorText.match(/<tag>/g)).toHaveLength(4);
+    expect(editorText.match(/裸/g)).toHaveLength(2);
+  });
+
+  it("still parses Markdown when HTML is only a syntax-highlight wrapper", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    editor.commands.setTextSelection(1);
+
+    const handled = paste(
+      editor,
+      "# Heading\n\nbody",
+      '<pre><code><span style="color: #888"># Heading</span><br><br>body</code></pre>',
+    );
+
+    expect(handled).toBe(true);
+    const json = editor.getJSON() as JsonNode;
+    const types = (json.content ?? []).map((n) => n.type);
+    expect(types).toContain("heading");
+  });
+
   it("inserts JSON clipboard text without running the Markdown parser", () => {
     editor = makeEditor({
       type: "doc",
@@ -178,6 +370,83 @@ describe("markdownPaste — code block context", () => {
     expectLiteralPaste(editor, text);
   });
 
+  it("preserves single unknown HTML-like tag (e.g. <T>)", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    editor.commands.setTextSelection(1);
+
+    const handled = paste(editor, "<T>");
+    expect(handled).toBe(true);
+    expect(editor.getText()).toBe("<T>");
+  });
+
+  it("preserves any unknown HTML-like tag (e.g. <MyComponent>)", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    editor.commands.setTextSelection(1);
+
+    const handled = paste(editor, "<MyComponent>");
+    expect(handled).toBe(true);
+    expect(editor.getText()).toBe("<MyComponent>");
+  });
+
+  it("preserves unknown tags in mixed multi-line content", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    editor.commands.setTextSelection(1);
+
+    const text = "<t>\n\n裸 `<tag>` 做转\n\n<tag>\n\n<t>";
+    const handled = paste(editor, text);
+    expect(handled).toBe(true);
+
+    const editorText = editor.getText();
+    expect(editorText).toContain("<t>");
+    expect(editorText).toContain("<tag>");
+    expect(editorText).toContain("裸");
+    expect(editorText).toContain("做转");
+  });
+
+  it("preserves HTML-like tags embedded in regular text", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    editor.commands.setTextSelection(1);
+
+    const text = "foo <bar> baz";
+    const handled = paste(editor, text);
+    expect(handled).toBe(true);
+    expect(editor.getText()).toBe(text);
+    expect(editor.getMarkdown()).toBe("foo &lt;bar&gt; baz");
+  });
+
+  it("preserves standard HTML element names as literal pasted text", () => {
+    editor = makeEditor({
+      type: "doc",
+      content: [{ type: "paragraph" }],
+    });
+
+    editor.commands.setTextSelection(1);
+
+    const text = 'foo <button> <img src="x"> baz';
+    const handled = paste(editor, text);
+    expect(handled).toBe(true);
+    expect(editor.getText()).toBe(text);
+    expect(editor.getMarkdown()).toBe(
+      'foo &lt;button&gt; &lt;img src="x"&gt; baz',
+    );
+  });
+
   it("does not parse oversized bracketed plain text as JSON", () => {
     editor = makeEditor({
       type: "doc",
@@ -190,5 +459,64 @@ describe("markdownPaste — code block context", () => {
 
     expectLiteralPaste(editor, text);
     expect(parseJsonSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("escapeRawHtmlTagsOutsideCode", () => {
+  it("escapes HTML-like tags", () => {
+    expect(escapeRawHtmlTagsOutsideCode("<T>")).toBe("&lt;T&gt;");
+    expect(escapeRawHtmlTagsOutsideCode("<tag>")).toBe("&lt;tag&gt;");
+    expect(escapeRawHtmlTagsOutsideCode("<MyComponent>")).toBe(
+      "&lt;MyComponent&gt;",
+    );
+    expect(escapeRawHtmlTagsOutsideCode("</tag>")).toBe("&lt;/tag&gt;");
+  });
+
+  it("escapes standard HTML element names too", () => {
+    expect(escapeRawHtmlTagsOutsideCode("<div>")).toBe("&lt;div&gt;");
+    expect(escapeRawHtmlTagsOutsideCode("<br>")).toBe("&lt;br&gt;");
+    expect(escapeRawHtmlTagsOutsideCode("</div>")).toBe("&lt;/div&gt;");
+    expect(escapeRawHtmlTagsOutsideCode('<img src="x">')).toBe(
+      '&lt;img src="x"&gt;',
+    );
+  });
+
+  it("does not escape inside inline code spans", () => {
+    expect(escapeRawHtmlTagsOutsideCode("`<tag>`")).toBe("`<tag>`");
+    expect(escapeRawHtmlTagsOutsideCode("text `<T>` more")).toBe(
+      "text `<T>` more",
+    );
+    expect(escapeRawHtmlTagsOutsideCode("``<tag>``")).toBe("``<tag>``");
+  });
+
+  it("does not escape inside fenced code blocks", () => {
+    expect(escapeRawHtmlTagsOutsideCode("```\n<T>\n```")).toBe(
+      "```\n<T>\n```",
+    );
+    expect(escapeRawHtmlTagsOutsideCode("~~~\n<tag>\n~~~")).toBe(
+      "~~~\n<tag>\n~~~",
+    );
+    expect(escapeRawHtmlTagsOutsideCode("   ```\n<T>\n   ```")).toBe(
+      "   ```\n<T>\n   ```",
+    );
+  });
+
+  it("escapes all tag-like runs in mixed content", () => {
+    expect(escapeRawHtmlTagsOutsideCode("<T> and <div>")).toBe(
+      "&lt;T&gt; and &lt;div&gt;",
+    );
+  });
+
+  it("handles multi-line mixed content", () => {
+    const input = "<t>\n\n裸 `<tag>` 做转\n\n<tag>\n\n<t>";
+    const result = escapeRawHtmlTagsOutsideCode(input);
+    expect(result).toBe(
+      "&lt;t&gt;\n\n裸 `<tag>` 做转\n\n&lt;tag&gt;\n\n&lt;t&gt;",
+    );
+  });
+
+  it("does not touch math expressions", () => {
+    expect(escapeRawHtmlTagsOutsideCode("1 < 2 > 0")).toBe("1 < 2 > 0");
+    expect(escapeRawHtmlTagsOutsideCode("x<y")).toBe("x<y");
   });
 });

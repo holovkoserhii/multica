@@ -8,13 +8,28 @@ Deploy Multica on your own infrastructure in minutes.
 |-----------|-------------|------------|
 | **Backend** | REST API + WebSocket server | Go (single binary) |
 | **Frontend** | Web application | Next.js 16 |
-| **Database** | Primary data store | PostgreSQL 17 with pgvector |
+| **Database** | Primary data store | PostgreSQL 17 (`pgcrypto` + `pg_trgm`) |
 
 Each user who runs AI agents locally also installs the **`multica` CLI** and runs the **agent daemon** on their own machine.
 
+## Anonymous Deployment Telemetry
+
+The self-hosted API server sends one first-party, deployment-level anonymous snapshot per UTC day to the fixed Multica endpoint `https://telemetry.multica.ai/v1/telemetry/events`. This helps maintainers understand which release versions are in use, deployment-size ranges, aggregate run volume, and how many members actively use a deployment. The endpoint is compiled into the server and cannot be redirected through configuration.
+
+The snapshot contains only the release version; bucketed counts of workspaces, distinct human members, active agents, and daemons seen in the previous 24 hours; aggregate counts of runs started, completed, failed, and cancelled in that window; and bucketed counts of members who opened the signed-in web or desktop app, and of members who personally started an agent run (assign, mention, comment, chat, manual run, or rerun — not autopilot or agent-to-agent delegation), in the previous 1, 7, and 28 complete UTC days. Members are counted per deployment and are never identified. It does not include names, email addresses or domains, IP addresses, business IDs, host/device details, repository or organization details, model/plugin data, prompts or output, comments or chats, paths, token/cost data, credentials, errors, stacks, or logs. This telemetry is not used for billing, licensing, authentication, or security decisions.
+
+Telemetry is enabled by default. To stop both collection and network delivery, set `DO_NOT_TRACK=1` or `DO_NOT_TRACK=true` on the API server and recreate/restart the backend. The deployment identity remains in PostgreSQL, so enabling it again does not create a new identity. `ANALYTICS_DISABLED` controls the separate PostHog integration and does not disable this first-party telemetry.
+
+When cloning a production database for staging or testing, clear the clone's `instance_telemetry_state` table before starting its API server (or set `DO_NOT_TRACK=true`); otherwise both deployments share one identity and their same-day snapshots can silently deduplicate each other.
+
 ## Quick Install (Recommended)
 
-Two commands to set up everything — server, CLI, and configuration:
+Two commands to set up everything — server, CLI, and configuration.
+
+<details open>
+<summary><b>macOS / Linux</b></summary>
+
+<br/>
 
 ```bash
 # 1. Install CLI + provision the self-host server
@@ -23,6 +38,20 @@ curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/ins
 # 2. Configure CLI, authenticate, and start the daemon
 multica setup self-host
 ```
+</details>
+<details>
+<summary><b>Windows (PowerShell)</b></summary>
+
+<br/>
+
+```powershell
+# 1. Install CLI + provision the self-host server
+$env:MULTICA_MODE="with-server"; irm https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.ps1 | iex
+
+# 2. Configure CLI, authenticate, and start the daemon
+multica setup self-host
+```
+</details>
 
 This installs the `multica` CLI, checks out the latest self-host assets, pulls the official Multica images from GHCR, and configures everything for localhost.
 
@@ -73,7 +102,7 @@ Open http://localhost:3000 in your browser. The Docker self-host stack defaults 
 - **Without email configured:** the verification code is generated server-side and printed to the backend container logs (look for `[DEV] Verification code for ...:`). Useful for one-off testing on a single machine.
 - **Deterministic local/private testing:** set `APP_ENV=development` and `MULTICA_DEV_VERIFICATION_CODE=888888` in `.env`, then restart the backend. This fixed code is ignored when `APP_ENV=production`.
 
-Changes to `ALLOW_SIGNUP` and `GOOGLE_CLIENT_ID` also take effect after restarting the backend / compose stack. The web UI reads both from `/api/config` at runtime, so no web rebuild is needed.
+Changes to `ALLOW_SIGNUP`, `DISABLE_WORKSPACE_CREATION`, `WORKSPACE_CREATION_ALLOWED_EMAILS`, and `GOOGLE_CLIENT_ID` also take effect after restarting the backend / compose stack. The web UI reads `ALLOW_SIGNUP`, `DISABLE_WORKSPACE_CREATION`, and `GOOGLE_CLIENT_ID` from `/api/config` at runtime, so no web rebuild is needed. `WORKSPACE_CREATION_ALLOWED_EMAILS` is read only by the backend and is not exposed through `/api/config`. See [Advanced Configuration → Signup Controls](SELF_HOSTING_ADVANCED.md#signup-controls-optional) for the recommended sequence to lock down workspace creation, or to limit it to selected users.
 
 > **Warning:** do **not** set `MULTICA_DEV_VERIFICATION_CODE` on a publicly reachable instance — anyone who knows an email address can then log in with that fixed code.
 
@@ -91,16 +120,31 @@ brew install multica-ai/tap/multica
 
 You also need at least one AI agent CLI installed:
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude` on PATH)
+- [Antigravity CLI](https://antigravity.google/docs/cli-install) (`agy` on PATH)
+- [CodeBuddy Code](https://www.codebuddy.ai/docs/cli/quickstart) (`codebuddy` on PATH)
+- [DevEco Code](https://gitcode.com/openharmony-sig/deveco-code) (`deveco` on PATH)
 - [Codex](https://github.com/openai/codex) (`codex` on PATH)
 - [GitHub Copilot CLI](https://docs.github.com/en/copilot) (`copilot` on PATH)
 - [OpenClaw](https://github.com/openclaw/openclaw) (`openclaw` on PATH)
 - [OpenCode](https://github.com/anomalyco/opencode) (`opencode` on PATH)
+- [Huawei Cloud CodeArts](https://support.huaweicloud.com/qs-codeartssnap/codeartsagent_qs_0004.html) (`codearts` on PATH)
 - [Hermes](https://github.com/NousResearch/hermes) (`hermes` on PATH)
-- Gemini (`gemini` on PATH)
 - [Pi](https://pi.dev/) (`pi` on PATH)
 - [Cursor Agent](https://cursor.com/) (`cursor-agent` on PATH)
 - Kimi (`kimi` on PATH)
+- [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) (`reasonix` on PATH; run `reasonix setup` first)
+- Dim (`dim` on PATH)
 - Kiro CLI (`kiro-cli` on PATH)
+- Qoder CLI (`qodercli` on PATH)
+- Qoder CN CLI (`qoderclicn` on PATH)
+- Trae CLI (`traecli` on PATH)
+- [Grok Build CLI](https://docs.x.ai/) (`grok` on PATH)
+- Qwen Code (`qwen` on PATH)
+- [Amp](https://ampcode.com/docs/cli) (`amp` on PATH on macOS, Linux or Windows through WSL; set an Amp access token in `AMP_API_KEY` on the daemon machine)
+- [Factory Droid](https://docs.factory.com/droid-exec/overview) (native `droid` 1.8.0+ on PATH; sign in or set `FACTORY_API_KEY` on the daemon machine; Linux requires glibc)
+- [QwenPaw](https://github.com/agentscope-ai/QwenPaw) (`qwenpaw` on PATH; pick its model in QwenPaw's own configuration)
+- [MiniMax Code CLI](https://www.npmjs.com/package/@minimax-ai/code) (`mcode` 0.1.2+ on PATH). Install a supported Node.js release (`>=22.19 <23` or `>=24 <27`), run `npm install --global @minimax-ai/code@latest`, then `mcode login`.
+- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh` on PATH with the Multica runtime profile installed; set `DEEPSEEK_API_KEY`)
 
 ### b) One-command setup
 
@@ -134,6 +178,267 @@ multica daemon status
 2. Navigate to **Settings → Runtimes** — you should see your machine listed
 3. Go to **Settings → Agents** and create a new agent
 4. Create an issue and assign it to your agent — it will pick up the task automatically
+
+---
+
+## Kubernetes Deployment (Alternative)
+
+If you already run a Kubernetes cluster, you can deploy Multica there instead of Docker Compose using the released OCI Helm chart at `oci://ghcr.io/multica-ai/charts/multica` or the source chart at [`deploy/helm/multica/`](deploy/helm/multica/). It targets a typical k3s / k8s setup with an Ingress controller and a default `ReadWriteOnce` StorageClass — authored against k3s + Traefik + `local-path`, and should work on any cluster with minor tweaks.
+
+The chart creates the following resources in the target namespace:
+
+- `multica-postgres` — `pgvector/pgvector:pg17` backed by a 10Gi PVC
+- `multica-backend` — Go API/WS server. Backed by a 5Gi `ReadWriteOnce` uploads PVC by default; set `backend.uploads.persistence.enabled=false` when you have configured S3 (`backend.config.s3Bucket`) and don't want the chart to declare the PVC at all.
+- `multica-frontend` — Next.js standalone server
+- Two `Ingress` resources: one for the web host, one for the backend host
+- `multica-config` ConfigMap (rendered from `values.yaml`)
+
+The `multica-secrets` Secret is **not** managed by the chart — you create it once with `kubectl` so real values never need to land in git.
+
+> **Runtime frontend upstreams:** current `multica-web` images read `REMOTE_API_URL` and `DOCS_URL` when the Next.js server runs, so API/docs upstream changes do not require a web rebuild. The chart defaults `REMOTE_API_URL` to this release's backend Service. `frontend.compatibility.backendAlias` exists only for legacy images that still baked `REMOTE_API_URL=http://backend:8080` at build time.
+
+> **Prerequisites:** `kubectl` and `helm` (v3.13+ for `--take-ownership`, or v4+) configured for the target cluster, an Ingress controller (Traefik / NGINX), and a default StorageClass.
+
+### Step 1 — Point hostnames at the cluster
+
+The chart defaults to `multica.dev.lan` (web) and `api.multica.dev.lan` (backend). Pick one of:
+
+- **`/etc/hosts`** on every machine that needs access (developer laptops + the machine running the daemon):
+
+  ```text
+  192.168.1.206  multica.dev.lan api.multica.dev.lan
+  ```
+
+  Replace `192.168.1.206` with any node IP where your Ingress controller's Service is reachable.
+
+- **Local DNS** (Pi-hole, Unbound, etc.): add A records for both hostnames pointing at the cluster Ingress IP.
+
+To use different hostnames, override the matching values at install time (see [Step 4](#step-4--install-the-chart)) — `ingress.frontend.host`, `ingress.backend.host`, plus `backend.config.appUrl`, `backend.config.frontendOrigin`, `backend.config.localUploadBaseUrl`, and `backend.config.googleRedirectUri`.
+
+### Step 2 — Create the namespace
+
+```bash
+kubectl create namespace multica
+```
+
+### Step 3 — Create the `multica-secrets` Secret
+
+The chart references this Secret by name. Create it once with random values:
+
+```bash
+kubectl -n multica create secret generic multica-secrets \
+  --from-literal=JWT_SECRET="$(openssl rand -hex 32)" \
+  --from-literal=POSTGRES_PASSWORD="$(openssl rand -hex 16)" \
+  --from-literal=RESEND_API_KEY="" \
+  --from-literal=GOOGLE_CLIENT_SECRET="" \
+  --from-literal=CLOUDFRONT_PRIVATE_KEY="" \
+  --from-literal=MULTICA_DEV_VERIFICATION_CODE=""
+```
+
+Leave optional values empty for now — you can fill them in later (see [Step 5 — Log In](#step-5--log-in)).
+
+### Step 4 — Install the chart
+
+```bash
+helm install multica oci://ghcr.io/multica-ai/charts/multica \
+  --version <chart-version> \
+  -n multica
+```
+
+Released chart versions strip the leading `v` from the Git tag. For example, release tag `v0.3.5` publishes chart version `0.3.5`; the chart defaults the backend and frontend image tags to `v0.3.5`.
+
+To override defaults, export the chart values, edit them, and pass them with `-f`:
+
+```bash
+helm show values oci://ghcr.io/multica-ai/charts/multica \
+  --version <chart-version> > my-values.yaml
+# edit my-values.yaml — e.g. change ingress hosts, image tags, resource limits
+helm install multica oci://ghcr.io/multica-ai/charts/multica \
+  --version <chart-version> \
+  -n multica \
+  -f my-values.yaml
+```
+
+When developing from a checkout, use the local chart path instead:
+
+```bash
+helm install multica deploy/helm/multica -n multica
+```
+
+If the backend has to reach services whose certificates come from an internal CA, such as a self-hosted Gitea, set `backend.extraCACerts.configMap`. See [Advanced Configuration → Private CA Certificates](SELF_HOSTING_ADVANCED.md#private-ca-certificates-optional).
+
+Watch the pods come up:
+
+```bash
+kubectl -n multica get pods -w
+```
+
+On a cold cluster the backend can sit `Running` but not `Ready` for a few minutes while it waits on PostgreSQL and runs migrations — a startupProbe absorbs this, so the pod should not restart. Once the backend reports `Ready`, migrations have completed and `/healthz` returns OK:
+
+```bash
+curl -H "Host: api.multica.dev.lan" http://<ingress-ip>/healthz
+# {"status":"ok","checks":{"db":"ok","migrations":"ok"}}
+```
+
+Then open http://multica.dev.lan in your browser.
+
+### Step 5 — Log In
+
+The chart defaults to `APP_ENV=production` (set in `values.yaml` under `backend.config.appEnv`), and there is no fixed verification code by default. Pick one of the following to log in — the same three options as the Docker setup:
+
+- **Recommended (production):** patch the Secret with a real Resend key, then restart the backend:
+
+  ```bash
+  kubectl -n multica patch secret multica-secrets --type=merge \
+    -p '{"stringData":{"RESEND_API_KEY":"re_xxx"}}'
+  kubectl -n multica rollout restart deploy/multica-backend
+  ```
+
+  Real verification codes will be sent to the email address you enter. See [Advanced Configuration → Email](SELF_HOSTING_ADVANCED.md#email-required-for-authentication).
+
+- **Without email configured:** the verification code is generated server-side and printed to the backend pod logs (look for `[DEV] Verification code for ...:`). Useful for one-off testing.
+
+  ```bash
+  kubectl -n multica logs -f deploy/multica-backend | grep "Verification code"
+  ```
+
+- **Deterministic local/private testing:** set `backend.config.appEnv: development` in your values file and `MULTICA_DEV_VERIFICATION_CODE=888888` in the Secret, then `helm upgrade` and restart. This fixed code is ignored when `APP_ENV=production`.
+
+  ```bash
+  helm upgrade multica oci://ghcr.io/multica-ai/charts/multica \
+    --version <chart-version> \
+    -n multica \
+    -f my-values.yaml --set backend.config.appEnv=development
+  kubectl -n multica patch secret multica-secrets --type=merge \
+    -p '{"stringData":{"MULTICA_DEV_VERIFICATION_CODE":"888888"}}'
+  kubectl -n multica rollout restart deploy/multica-backend
+  ```
+
+`ALLOW_SIGNUP`, `DISABLE_WORKSPACE_CREATION`, `WORKSPACE_CREATION_ALLOWED_EMAILS`, and `GOOGLE_CLIENT_ID` likewise live under `backend.config.*` in `values.yaml` (as `allowSignup`, `disableWorkspaceCreation`, `workspaceCreationAllowedEmails`, and `googleClientId`). After `helm upgrade`, the backend pod will roll automatically because the ConfigMap hash changes; the web UI reads `allowSignup`, `disableWorkspaceCreation`, and `googleClientId` from `/api/config` at runtime, so no web rebuild is needed. `workspaceCreationAllowedEmails` is read only by the backend and is not exposed through `/api/config`.
+
+> **Warning:** do **not** set `MULTICA_DEV_VERIFICATION_CODE` on a publicly reachable instance — anyone who knows an email address can then log in with that fixed code.
+
+### Step 6 — Install CLI & Start Daemon
+
+The daemon runs on your local machine, not in the cluster. Install the CLI and an AI agent as in [Step 3](#step-3--install-cli--start-daemon) above, then point the CLI at your Ingress hostnames:
+
+```bash
+multica setup self-host \
+  --server-url http://api.multica.dev.lan \
+  --app-url http://multica.dev.lan
+```
+
+Make sure the machine running the daemon has the same `/etc/hosts` (or DNS) entries from [Step 1](#step-1--point-hostnames-at-the-cluster).
+
+### Updating
+
+To pull the latest images without changing the chart version when your values still use the mutable `latest` image tag:
+
+```bash
+kubectl -n multica rollout restart deploy/multica-backend deploy/multica-frontend
+```
+
+To upgrade to a specific Multica release, upgrade to the matching chart version. The released chart defaults its app images to the matching Git tag:
+
+```bash
+helm upgrade multica oci://ghcr.io/multica-ai/charts/multica \
+  --version <chart-version> \
+  -n multica \
+  -f my-values.yaml
+```
+
+If you need to override the app images independently from the chart version, set the image tags in your values file:
+
+```yaml
+images:
+  backend:
+    tag: v0.2.4
+  frontend:
+    tag: v0.2.4
+```
+
+Then run the same upgrade command with `-f my-values.yaml`:
+
+```bash
+helm upgrade multica oci://ghcr.io/multica-ai/charts/multica \
+  --version <chart-version> \
+  -n multica \
+  -f my-values.yaml
+```
+
+To roll back if an upgrade goes sideways:
+
+```bash
+helm -n multica rollback multica
+```
+
+> **Upgrading from `v0.3.4` to `v0.3.5+` fails with `refusing to drop legacy daily rollups: ...`?** As of MUL-2957 the `migrate up` command runs an idempotent monthly-slice backfill automatically before applying migration `103`, so a clean upgrade is a single `helm upgrade` + backend rollout. If you are still on a pre-MUL-2957 binary or the auto-hook fails, run the standalone backfill against the same database the chart is using (`kubectl -n multica exec deploy/multica-backend -- ./backfill_task_usage_hourly --sleep-between-slices=2s`), then restart the backend deployment to re-apply migrations. See [Advanced Configuration → Usage Dashboard Rollup](SELF_HOSTING_ADVANCED.md#usage-dashboard-rollup) for the full recovery flow.
+
+### Tearing down
+
+```bash
+# Remove the workloads but keep the PVCs and the Secret
+helm -n multica uninstall multica
+
+# Wipe everything, including PostgreSQL data and uploads
+kubectl delete namespace multica
+```
+
+---
+
+## Usage Dashboard Rollup
+
+The Usage / Runtime dashboards read from a derived `task_usage_hourly` table populated by `rollup_task_usage_hourly()`. As of MUL-2957 the backend runs this rollup **in-process** on every replica via a DB-backed scheduler (`sys_cron_executions`); a fresh self-host install needs no operator action and the bundled `pgvector/pgvector:pg17` image works without changes — you do **not** need to swap it for an image that ships `pg_cron`, register an external cron job, set up a systemd timer, or run a Kubernetes `CronJob`.
+
+Multiple backend replicas are safe: each replica ticks every 30 seconds and tries to claim the current 5-minute UTC plan, but the unique key `(job_name, scope_kind, scope_id, plan_time)` means only one wins each plan. Inspect steady-state operation:
+
+> **WeCom (企业微信) smart bot and replica count.** Unlike Slack and Lark, whose outbound is stateless HTTP that any replica can perform, the WeCom smart bot's only outbound path is an in-process WebSocket long connection, held by the replica that owns that bot's lease. What happens to a reply produced on a *different* replica depends on the realtime relay:
+>
+> - **Sharded or dual relay mode (`REDIS_URL` set, the default with Redis):** the reply or inbox push is forwarded to the lease holder over the relay and delivered. Multi-replica WeCom is supported in this mode.
+> - **Legacy relay mode, or no Redis:** the reply is dropped and the WeCom user sees nothing. Run the WeCom-enabled backend as a single replica in this configuration.
+>
+> In **every** mode there is one residual window: a reply produced while *no* replica holds a live connection to that bot — all of them mid-reconnect — is not delivered. It is **counted**: the replica that routed it checks afterwards whether any replica ever claimed the delivery, and increments `multica_wecom_outbound_dropped_total{reason="no_live_connection"}` when none did, so the window can be measured on a deployment rather than guessed at. If a rare lost reply during reconnects is unacceptable, a single replica remains the most conservative deployment. Everything else (including the rollup scheduler above) is multi-replica safe.
+
+```sql
+SELECT plan_time, status, attempt, runner_id,
+       error_code, error_msg, started_at, finished_at
+  FROM sys_cron_executions
+ WHERE job_name = 'rollup_task_usage_hourly'
+ ORDER BY plan_time DESC
+ LIMIT 20;
+```
+
+Full reference (audit table semantics, advisory lock 4246, the standalone backfill command, flag descriptions, the `v0.3.4 → v0.3.5+` migration auto-hook) lives in [Advanced Configuration → Usage Dashboard Rollup](SELF_HOSTING_ADVANCED.md#usage-dashboard-rollup).
+
+> **Upgrading from `v0.3.4` to `v0.3.5+`?** As of MUL-2957 the `migrate up` command runs an idempotent monthly-slice backfill automatically right before applying migration `103`, so the upgrade completes in a single invocation — no operator step required. If you are still on a pre-MUL-2957 binary or the auto-hook fails for an environmental reason, run `backfill_task_usage_hourly` against the same database and re-run the upgrade. See [Advanced Configuration → Usage Dashboard Rollup](SELF_HOSTING_ADVANCED.md#usage-dashboard-rollup) for the recovery flow.
+
+### Compatibility paths (existing deployments only)
+
+External schedulers — **`pg_cron` registered on the database, an external cron job, a systemd timer, or a Kubernetes `CronJob`** — that call `SELECT rollup_task_usage_hourly()` directly were the only option before MUL-2957 and remain a supported compatibility path. They are no longer the recommended setup; new deployments should rely on the in-process scheduler instead. The SQL function holds advisory lock 4246 internally, so the in-process scheduler and any pre-existing external schedule can coexist without ever double-writing the rollup.
+
+If you already have a `pg_cron` job in production, the safe sequence to retire it is:
+
+1. Confirm the in-process scheduler is healthy on at least one backend replica — recent SUCCESS rows should be landing in `sys_cron_executions` for `rollup_task_usage_hourly`:
+
+   ```sql
+   SELECT plan_time, status, runner_id, finished_at
+     FROM sys_cron_executions
+    WHERE job_name = 'rollup_task_usage_hourly'
+      AND status = 'SUCCESS'
+    ORDER BY plan_time DESC
+    LIMIT 5;
+   ```
+
+2. Once SUCCESS rows are arriving on schedule, unschedule the redundant `pg_cron` entry:
+
+   ```sql
+   SELECT cron.unschedule('rollup_task_usage_hourly')
+     FROM cron.job WHERE jobname = 'rollup_task_usage_hourly';
+   ```
+
+3. Leave the `pg_cron` extension itself installed unless you are sure no other workload depends on it. The bundled `pgvector/pgvector:pg17` image does **not** ship `pg_cron`, so nothing in Multica's default install needs it; uninstalling `pg_cron` from a custom image that other workloads still use is a separate decision.
+
+External cron / systemd timer / Kubernetes `CronJob` setups that call `SELECT rollup_task_usage_hourly()` directly can be retired the same way — once `sys_cron_executions` shows steady SUCCESS rows from the in-process scheduler, the external job is redundant and can be removed.
 
 ## Stopping Services
 
@@ -175,6 +480,32 @@ docker compose -f docker-compose.selfhost.yml up -d
 Pin `MULTICA_IMAGE_TAG` in `.env` to an exact version like `v0.2.4` if you want to stay on a specific release. Migrations run automatically on backend startup.
 If the selected GHCR tag has not been published yet, fall back to `make selfhost-build` or `docker compose -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build`.
 
+> **Upgrading from `v0.3.4` to `v0.3.5+` fails with `refusing to drop legacy daily rollups: ...`?** That's migration `103`'s fail-closed guard: it requires `task_usage_hourly` to be seeded before the legacy daily rollups are dropped. As of MUL-2957 `migrate up` runs that backfill automatically right before applying `103`, so the upgrade completes in a single invocation. If you are still on a pre-MUL-2957 binary or the auto-hook fails, run `backfill_task_usage_hourly` manually first, then re-run the upgrade. Full instructions in [Advanced Configuration → Usage Dashboard Rollup](SELF_HOSTING_ADVANCED.md#usage-dashboard-rollup).
+
+> **Backend restarting with `password authentication failed for user "multica"` after an upgrade or a second `make selfhost`?** Installs first started by an older `make selfhost` or `make selfhost-build` initialized PostgreSQL with the default password instead of the generated `POSTGRES_PASSWORD` in `.env`, so the backend is rejected once the containers are recreated. Set the database password to the value in `.env`; this keeps your data:
+>
+> ```bash
+> docker compose -f docker-compose.selfhost.yml up -d --wait postgres
+> docker compose -f docker-compose.selfhost.yml exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -v role="$POSTGRES_USER" -U "$POSTGRES_USER" -d postgres' <<'SQL'
+> \getenv pw POSTGRES_PASSWORD
+> ALTER USER :"role" WITH PASSWORD :'pw';
+> SQL
+> ```
+>
+> Then restart the stack using the Compose files for your installation. For official images (`make selfhost`):
+>
+> ```bash
+> docker compose -f docker-compose.selfhost.yml up -d
+> ```
+>
+> For locally built images (`make selfhost-build`), keep the build override so recovery uses your existing local images:
+>
+> ```bash
+> docker compose -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d
+> ```
+>
+> The command connects as `POSTGRES_USER` from `.env`. If you changed that value after the first start, put the original user name back first: PostgreSQL keeps the role it was initialized with. Do not run `docker compose down -v` to fix this: it deletes the database volume.
+
 ---
 
 ## Manual Docker Compose Setup
@@ -187,7 +518,9 @@ cd multica
 cp .env.example .env
 ```
 
-Edit `.env` — at minimum, change `JWT_SECRET`:
+Edit `.env` — set `JWT_SECRET` (required): docker compose refuses to start without
+it, and a production backend refuses to boot on the dev default or any known
+placeholder.
 
 ```bash
 JWT_SECRET=$(openssl rand -hex 32)
