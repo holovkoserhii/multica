@@ -1,0 +1,20 @@
+# Multica on GCP — Caddy reverse proxy, rendered by deploy.sh into /etc/caddy/Caddyfile.
+# Host defaults to <ip-with-dashes>.sslip.io, a free wildcard DNS that needs no setup.
+
+app.__HOST__ {
+    reverse_proxy localhost:3000
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+    encode zstd gzip
+}
+
+# API for the multica CLI / agent daemon (REST + WebSocket).
+api.__HOST__ {
+    reverse_proxy localhost:8080
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    encode zstd gzip
+}

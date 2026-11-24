@@ -1,0 +1,27 @@
+# Override for running the self-host stack against an external Postgres (Neon)
+# on a small VM (GCP e2-micro, 1 GB RAM). Use together with the base file:
+#
+#   docker compose -f docker-compose.selfhost.yml -f deploy/gcp/docker-compose.neon.yml up -d
+#
+# - The bundled postgres service is moved behind a profile, so it never starts.
+# - The backend reads DATABASE_URL from .env (Neon *direct* connection string,
+#   not the -pooler host, so migrations and prepared statements work).
+# - Memory caps keep the two containers from pushing the VM into heavy swap.
+
+services:
+  postgres:
+    profiles: ["local-db"]
+
+  backend:
+    depends_on: !reset []
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must point at the Neon database}
+      DATABASE_MAX_CONNS: ${DATABASE_MAX_CONNS:-5}
+      DATABASE_MIN_CONNS: ${DATABASE_MIN_CONNS:-0}
+      MULTICA_DATABASE_CONNECT_TIMEOUT: ${MULTICA_DATABASE_CONNECT_TIMEOUT:-15s}
+    mem_limit: 300m
+
+  frontend:
+    environment:
+      NODE_OPTIONS: --max-old-space-size=256
+    mem_limit: 350m
